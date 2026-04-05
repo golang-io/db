@@ -1,32 +1,52 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# -----------------------------------------------------------------------------
+# Go：可执行文件与插件 / Binaries for programs and plugins
+# -----------------------------------------------------------------------------
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
-# Test binary, built with `go test -c`
+# `go test -c` 生成的测试二进制 / Test binary built with go test -c
 *.test
 
-# Code coverage profiles and other test artifacts
+# -----------------------------------------------------------------------------
+# Go：测试结果与覆盖率 / Test output and coverage
+# -----------------------------------------------------------------------------
 *.out
 coverage.*
 *.coverprofile
 profile.cov
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# -----------------------------------------------------------------------------
+# Go：依赖目录（使用 go mod、不提交 vendor 时保持忽略）/ Vendored modules
+# -----------------------------------------------------------------------------
+vendor/
 
-# Go workspace file
+# -----------------------------------------------------------------------------
+# Go：workspace 本地配置 / Local workspace file
+# -----------------------------------------------------------------------------
 go.work
 go.work.sum
 
-# env file
+# -----------------------------------------------------------------------------
+# 本地环境与密钥（勿提交）/ Local env and secrets
+# -----------------------------------------------------------------------------
 .env
+.env.*
+!.env.example
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# -----------------------------------------------------------------------------
+# 操作系统 / OS
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------------------------------------------------------------
+# 编辑器与 IDE / Editors
+# -----------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
