@@ -108,6 +108,13 @@ func format(s, format string) (any, error) {
 		if s == "0001-01-01T00:00:00Z" || s == "" {
 			return &time.Time{}, nil
 		}
+		// 尝试多种时间格式：RFC3339（ISO 8601）、MySQL DateTime
+		for _, layout := range []string{time.RFC3339, time.DateTime, "2006-01-02T15:04:05"} {
+			if t, err := time.Parse(layout, s); err == nil {
+				return &t, nil
+			}
+		}
+		// 最后用 Local 时区尝试 DateTime 格式
 		t, err := time.ParseInLocation(time.DateTime, s, time.Local)
 		if err != nil {
 			return nil, err
