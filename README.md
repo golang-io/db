@@ -25,8 +25,6 @@
 go get github.com/golang-io/db
 ```
 
-按需已间接依赖 `gorm.io/driver/mysql`、`gorm.io/driver/sqlite`、`gorm.io/driver/clickhouse` 与 `gorm.io/gorm`。
-
 ## 快速开始
 
 ```go
