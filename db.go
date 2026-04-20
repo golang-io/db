@@ -7,8 +7,8 @@
 //     Multi-driver support: MySQL, SQLite, ClickHouse
 //   - Options 结构体配置连接参数，支持 YAML 反序列化
 //     Options struct for connection configuration, supports YAML deserialization
-//   - 连接池：MaxIdleConns、MaxOpenConns、ConnMaxLifetime
-//     Connection pool: MaxIdleConns, MaxOpenConns, ConnMaxLifetime
+//   - 连接池：MaxIdleConns、MaxOpenConns、ConnMaxLifetime、ConnMaxIdleTime
+//     Connection pool: MaxIdleConns, MaxOpenConns, ConnMaxLifetime, ConnMaxIdleTime
 //   - 懒连接：首次 GetDB 时建立连接，连接失败每 10 秒重试
 //     Lazy connection: connect on first GetDB call; retry every 10s on failure
 //   - 双通道日志：SQL 走标准 log（Output），业务（连接/重试）走 Logger（对接 slog）
@@ -51,9 +51,10 @@ type Options struct {
 	Name            string          `yaml:"Name"`            // 实例名，用于 GetDB(ctx, name) / Instance name for lookup
 	URL             string          `yaml:"URL"`             // 连接串 scheme://dsn，如 mysql://... 或 sqlite://... / Connection URL
 	TimeZone        string          `yaml:"TimeZone"`        // 时区，如 "Local" / Timezone
-	MaxIdleConns    int             `yaml:"MaxIdleConns"`    // 连接池最大空闲连接数，默认 200 / Max idle connections
-	MaxOpenConns    int             `yaml:"MaxOpenConns"`    // 连接池最大打开连接数，默认 200 / Max open connections
-	ConnMaxLifeTime time.Duration   `yaml:"ConnMaxLifeTime"` // 连接最大存活时间，默认 1h / Conn max lifetime
+	MaxIdleConns    int             `yaml:"MaxIdleConns"`    // 连接池最大空闲连接数，默认 10 / Max idle connections
+	MaxOpenConns    int             `yaml:"MaxOpenConns"`    // 连接池最大打开连接数，默认 50 / Max open connections
+	ConnMaxLifeTime time.Duration   `yaml:"ConnMaxLifeTime"` // 连接最大存活时间，默认 30m / Conn max lifetime
+	ConnMaxIdleTime time.Duration   `yaml:"ConnMaxIdleTime"` // 连接最大空闲时间，默认 5m；用于回收被上游（MySQL wait_timeout / LB 空闲超时）静默关闭的连接 / Conn max idle time; reclaim conns silently closed by upstream
 	LongQueryTime   time.Duration   `yaml:"LongQueryTime"`   // 慢查询阈值，超过打 SLOW 日志，默认 3s / Slow query threshold
 	Output          io.Writer       `yaml:"-"`               // SQL 日志输出，默认 os.Stdout / SQL log output
 	Log             Logger          `yaml:"-"`               // 业务日志（连接、重试），对接 slog / Business logger
@@ -84,6 +85,9 @@ func (o *Options) LoadOptions() []Option {
 	}
 	if o.ConnMaxLifeTime != 0 {
 		opts = append(opts, ConnMaxLifeTime(o.ConnMaxLifeTime))
+	}
+	if o.ConnMaxIdleTime != 0 {
+		opts = append(opts, ConnMaxIdleTime(o.ConnMaxIdleTime))
 	}
 	if o.LongQueryTime != 0 {
 		opts = append(opts, LongQueryTime(o.LongQueryTime))
@@ -194,11 +198,24 @@ func MaxIdleConns(n int) Option {
 	}
 }
 
-// ConnMaxLifeTime 设置连接的最大存活时间。默认 1 小时。超时的连接会被关闭并回收。
-// Sets max connection lifetime. Default 1 hour. Expired connections are closed and recycled.
+// ConnMaxLifeTime 设置连接的最大存活时间。默认 30 分钟。超时的连接会被关闭并回收。
+// 取值建议严格小于 MySQL 的 wait_timeout 以及链路上任何 LB 的 TCP 空闲超时，避免拿到已被对端关闭的死连接（broken pipe）。
+// Sets max connection lifetime. Default 30 minutes. Should be strictly less than MySQL's wait_timeout
+// and any LB TCP idle timeout to avoid using connections silently closed by upstream (broken pipe).
 func ConnMaxLifeTime(d time.Duration) Option {
 	return func(opts *Options) {
 		opts.ConnMaxLifeTime = d
+	}
+}
+
+// ConnMaxIdleTime 设置连接的最大空闲时间。默认 5 分钟。空闲超过该时长的连接会被关闭。
+// 主要用于回收被上游（MySQL wait_timeout / 中间 LB 空闲超时）静默关闭的空闲连接，
+// 避免 "write tcp ... broken pipe" 错误。取值应小于链路上最小的空闲超时（一般 LB 为 900s）。
+// Sets max idle duration of a connection. Default 5 minutes. Reclaims idle connections that may have been
+// silently closed by upstream (MySQL wait_timeout / LB idle timeout), preventing "broken pipe" errors.
+func ConnMaxIdleTime(d time.Duration) Option {
+	return func(opts *Options) {
+		opts.ConnMaxIdleTime = d
 	}
 }
 
@@ -206,9 +223,10 @@ func ConnMaxLifeTime(d time.Duration) Option {
 // Merges defaults with user Options and returns the full Options.
 func newOptions(opts ...Option) Options {
 	options := Options{
-		MaxIdleConns:    200,
-		MaxOpenConns:    200,
-		ConnMaxLifeTime: 1 * time.Hour,
+		MaxIdleConns:    10,
+		MaxOpenConns:    50,
+		ConnMaxLifeTime: 5 * time.Minute,
+		ConnMaxIdleTime: 1 * time.Minute,
 		LongQueryTime:   3 * time.Second,
 		Log:             &noLogger{},
 		LogLevel:        logger.Warn,
@@ -293,6 +311,7 @@ func (my *db) OpenDB() (*gorm.DB, error) {
 	db.SetMaxIdleConns(my.opts.MaxIdleConns)
 	db.SetMaxOpenConns(my.opts.MaxOpenConns)
 	db.SetConnMaxLifetime(my.opts.ConnMaxLifeTime)
+	db.SetConnMaxIdleTime(my.opts.ConnMaxIdleTime)
 	if my.opts.schema == "sqlite" && my.opts.URL != ":memory:" {
 		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
 			return nil, fmt.Errorf("set journal mode error: %w", err)

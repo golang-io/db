@@ -11,7 +11,7 @@
 | 多驱动 | `mysql` / `sqlite` / `clickhouse`，通过 `CreateDB` 按 URL scheme 自动分发 |
 | 全局多实例 | `Name` 注册，`GetDB(ctx, name)` 获取带 `context` 的 `*gorm.DB` |
 | 懒连接 | 首次 `GetDB` 时建连；失败时每 **10s** 重试（业务日志走 `Logger`） |
-| 连接池 | `MaxIdleConns` / `MaxOpenConns` / `ConnMaxLifeTime`（含合理默认值） |
+| 连接池 | `MaxIdleConns` / `MaxOpenConns` / `ConnMaxLifeTime` / `ConnMaxIdleTime`（含合理默认值） |
 | 日志 | SQL → 标准 `log` 风格（`Output`）；连接/重试 → `Logger`（可对接 `slog`） |
 | 配置 | `Options` 支持 YAML 标签；亦可使用函数式 `Option` |
 
@@ -24,6 +24,8 @@
 ```bash
 go get github.com/golang-io/db
 ```
+
+按需已间接依赖 `gorm.io/driver/mysql`、`gorm.io/driver/sqlite`、`gorm.io/driver/clickhouse` 与 `gorm.io/gorm`。
 
 ## 快速开始
 
@@ -107,8 +109,9 @@ gormDB, err := db.OpenClickHouse(opts)
 |------|------|----------------------------|
 | `Name` | 实例名，用于 `GetDB` | 必填（注册路径） |
 | `URL` | 连接串 | 必填 |
-| `MaxIdleConns` / `MaxOpenConns` | 连接池 | 200 / 200 |
-| `ConnMaxLifeTime` | 连接最大存活时间 | 1h |
+| `MaxIdleConns` / `MaxOpenConns` | 连接池 | 10 / 50 |
+| `ConnMaxLifeTime` | 连接最大存活时间 | 30m |
+| `ConnMaxIdleTime` | 连接最大空闲时间（回收被 MySQL/LB 静默关闭的空闲连接） | 5m |
 | `LongQueryTime` | 慢查询阈值（日志 `SLOW:`） | 3s |
 | `Output` | SQL 日志 `io.Writer` | `os.Stdout` |
 | `Log` | 业务日志（连接、重试） | 空实现 |
