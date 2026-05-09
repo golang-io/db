@@ -278,7 +278,7 @@ func (my *db) open(f func(dsn string) gorm.Dialector) error {
 // OpenDB 使用 dialector 打开 GORM 连接并配置连接池参数。
 // 若 Name 非空，连接成功后自动 Load 到全局 dbm。
 // Opens GORM connection with dialector and configures connection pool. If Name is set, auto-registers to dbm.
-func (my *db) OpenDB() (*gorm.DB, error) {
+func (my *db) OpenDB(ctx context.Context) (*gorm.DB, error) {
 	if my.opts.Name == "" {
 		return nil, fmt.Errorf("name is required, dsnURL: %s", my.opts.URL)
 	}
@@ -312,6 +312,16 @@ func (my *db) OpenDB() (*gorm.DB, error) {
 	db.SetMaxOpenConns(my.opts.MaxOpenConns)
 	db.SetConnMaxLifetime(my.opts.ConnMaxLifeTime)
 	db.SetConnMaxIdleTime(my.opts.ConnMaxIdleTime)
+
+	// 真实探活：gorm.Open 仅构造 dialector，并未真正发包到 DB；这里立刻 Ping 一次，
+	// 避免出现"open 成功但首查询才暴露不可达"的假连通状态。
+	// 5s 超时防止在网络黑洞里阻塞 Connect 循环。
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		return nil, fmt.Errorf("ping db error: %w", err)
+	}
+
 	if my.opts.schema == "sqlite" && my.opts.URL != ":memory:" {
 		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
 			return nil, fmt.Errorf("set journal mode error: %w", err)
@@ -328,13 +338,17 @@ func (my *db) OpenDB() (*gorm.DB, error) {
 func (my *db) Connect(ctx context.Context) *db {
 	my.once.Do(func() {
 		for {
-			if _, err := my.OpenDB(); err != nil {
-				my.opts.Log.Error(ctx, "connect db error", "url", my.opts.URL, "err", err)
-				time.Sleep(10 * time.Second)
-				continue
+			var err error
+			if _, err = my.OpenDB(ctx); err == nil {
+				my.opts.Log.Info(ctx, "db connected", "name", my.opts.Name)
+				return
 			}
-			my.opts.Log.Info(ctx, "db connected", "name", my.opts.Name)
-			return
+			my.opts.Log.Error(ctx, "connect db error", "url", my.opts.URL, "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(10 * time.Second):
+			}
 		}
 	})
 	return my

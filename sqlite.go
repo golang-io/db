@@ -1,6 +1,8 @@
 package db
 
 import (
+	"context"
+
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
@@ -48,10 +50,10 @@ func NewSQLite(options Options) error {
 //
 // Opens SQLite immediately and returns *gorm.DB without registering to global dbm.
 // Use for one-off jobs, migrations, local tools, etc., when name-based GetDB is not needed.
-func OpenSQLite(options Options) (*gorm.DB, error) {
+func OpenSQLite(ctx context.Context, options Options) (*gorm.DB, error) {
 	my := setup(options)
 	if err := my.open(sqlite.Open); err != nil {
 		return nil, err
 	}
-	return my.OpenDB()
+	return my.OpenDB(ctx)
 }

@@ -1,6 +1,8 @@
 package db
 
 import (
+	"context"
+
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -44,10 +46,10 @@ func NewMySQL(options Options) error {
 //
 // Opens MySQL immediately and returns *gorm.DB without registering to global dbm.
 // Use for one-off jobs, migrations, etc., when name-based GetDB is not needed.
-func OpenMySQL(options Options) (*gorm.DB, error) {
+func OpenMySQL(ctx context.Context, options Options) (*gorm.DB, error) {
 	my := setup(options)
 	if err := my.open(mysql.Open); err != nil {
 		return nil, err
 	}
-	return my.OpenDB()
+	return my.OpenDB(ctx)
 }

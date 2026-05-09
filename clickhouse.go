@@ -1,6 +1,8 @@
 package db
 
 import (
+	"context"
+
 	"gorm.io/driver/clickhouse"
 	"gorm.io/gorm"
 )
@@ -44,10 +46,10 @@ func NewClickHouse(options Options) error {
 //
 // Opens ClickHouse immediately and returns *gorm.DB without registering to global dbm.
 // Use for one-off jobs, migrations, etc., when name-based GetDB is not needed.
-func OpenClickHouse(options Options) (*gorm.DB, error) {
+func OpenClickHouse(ctx context.Context, options Options) (*gorm.DB, error) {
 	my := setup(options)
 	if err := my.open(clickhouse.Open); err != nil {
 		return nil, err
 	}
-	return my.OpenDB()
+	return my.OpenDB(ctx)
 }
