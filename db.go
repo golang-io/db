@@ -300,13 +300,13 @@ func (my *db) OpenDB(ctx context.Context) (*gorm.DB, error) {
 
 	var err error
 	if my.db, err = gorm.Open(my.dialector, config); err != nil {
-		return nil, fmt.Errorf("open db error: %w", err)
+		return nil, fmt.Errorf("open db error: name=%s, %w", my.opts.Name, err)
 	}
 
 	// 获取 sql.DB 实例，设置连接池参数
 	db, err := my.db.DB()
 	if err != nil {
-		return nil, fmt.Errorf("get sql.DB error: %w", err)
+		return nil, fmt.Errorf("get sql.DB error: name=%s, %w", my.opts.Name, err)
 	}
 	db.SetMaxIdleConns(my.opts.MaxIdleConns)
 	db.SetMaxOpenConns(my.opts.MaxOpenConns)
@@ -319,12 +319,12 @@ func (my *db) OpenDB(ctx context.Context) (*gorm.DB, error) {
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
-		return nil, fmt.Errorf("ping db error: %w", err)
+		return nil, fmt.Errorf("ping db error: name=%s, %w", my.opts.Name, err)
 	}
 
 	if my.opts.schema == "sqlite" && my.opts.URL != ":memory:" {
 		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-			return nil, fmt.Errorf("set journal mode error: %w", err)
+			return nil, fmt.Errorf("set journal mode error: name=%s, %w", my.opts.Name, err)
 		}
 	}
 	return my.db, nil
@@ -343,7 +343,7 @@ func (my *db) Connect(ctx context.Context) *db {
 				my.opts.Log.Info(ctx, "db connected", "name", my.opts.Name)
 				return
 			}
-			my.opts.Log.Error(ctx, "connect db error", "url", my.opts.URL, "err", err)
+			my.opts.Log.Error(ctx, "connect db error", "name", my.opts.Name, "url", my.opts.URL, "err", err)
 			select {
 			case <-ctx.Done():
 				return
