@@ -38,9 +38,11 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -241,10 +243,30 @@ func newOptions(opts ...Option) Options {
 // db 封装 GORM 连接、配置与懒初始化，实现 DB 接口。
 // Wraps GORM connection, config, and lazy init; implements DB interface.
 type db struct {
-	db        *gorm.DB       // GORM 实例，Connect 后可用 / GORM instance, valid after Connect
-	opts      Options        // 配置选项 / Options
-	once      sync.Once      // 保证 Connect 只执行一次 / Ensures Connect runs once
-	dialector gorm.Dialector // 驱动（mysql / sqlite） / Driver
+	db        atomic.Pointer[gorm.DB] // GORM 实例，原子读写：后台重试协程替换实例，与并发读形成数据竞争 / GORM instance, read/written atomically: retry goroutine replaces it concurrently with business reads
+	opts      Options                 // 配置选项 / Options
+	once      sync.Once               // 保证首次建连只触发一次 / Ensures first connect runs once
+	dialector gorm.Dialector          // 驱动（mysql / sqlite） / Driver
+}
+
+// markError 给建连失败得到的实例补齐 Statement 并挂上错误，供调用方安全使用。
+// gorm.Open 在 Dialector.Initialize 失败时返回的是 Statement 为 nil 的实例（Statement 只在
+// 初始化成功后才赋值）；直接返回会让调用方在 WithContext → Statement.clone() 处空指针 panic。
+// 补齐后 gorm 各 callback 均以 db.Error == nil 为前提，链式调用会直接短路，错误经 .Error 回传。
+func markError(gdb *gorm.DB, err error) *gorm.DB {
+	if gdb == nil {
+		return nil
+	}
+	if gdb.Statement == nil {
+		gdb.Statement = &gorm.Statement{
+			DB:       gdb,
+			ConnPool: gdb.ConnPool,
+			Context:  context.Background(),
+			Clauses:  map[string]clause.Clause{},
+		}
+	}
+	gdb.Error = err
+	return gdb
 }
 
 // setup 根据 Options 结构体创建 db 实例，不立即建连。
@@ -298,15 +320,24 @@ func (my *db) OpenDB(ctx context.Context) (*gorm.DB, error) {
 		config.SkipDefaultTransaction = false
 	}
 
+	// openErr 统一失败出口：把错误挂到（可能半初始化的）实例上再返回，
+	// 保证调用方拿到的永远是一个"可用、但带错误"的实例，而不是 Statement==nil 的坏实例。
+	var gdb *gorm.DB
+	openErr := func(format string, a ...any) error {
+		err := fmt.Errorf(format, a...)
+		my.db.Store(markError(gdb, err))
+		return err
+	}
+
 	var err error
-	if my.db, err = gorm.Open(my.dialector, config); err != nil {
-		return nil, fmt.Errorf("open db error: name=%s, %w", my.opts.Name, err)
+	if gdb, err = gorm.Open(my.dialector, config); err != nil {
+		return nil, openErr("open db error: name=%s, %w", my.opts.Name, err)
 	}
 
 	// 获取 sql.DB 实例，设置连接池参数
-	db, err := my.db.DB()
+	db, err := gdb.DB()
 	if err != nil {
-		return nil, fmt.Errorf("get sql.DB error: name=%s, %w", my.opts.Name, err)
+		return nil, openErr("get sql.DB error: name=%s, %w", my.opts.Name, err)
 	}
 	db.SetMaxIdleConns(my.opts.MaxIdleConns)
 	db.SetMaxOpenConns(my.opts.MaxOpenConns)
@@ -319,48 +350,64 @@ func (my *db) OpenDB(ctx context.Context) (*gorm.DB, error) {
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
-		return nil, fmt.Errorf("ping db error: name=%s, %w", my.opts.Name, err)
+		return nil, openErr("ping db error: name=%s, %w", my.opts.Name, err)
 	}
 
 	if my.opts.schema == "sqlite" && my.opts.URL != ":memory:" {
 		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-			return nil, fmt.Errorf("set journal mode error: name=%s, %w", my.opts.Name, err)
+			return nil, openErr("set journal mode error: name=%s, %w", my.opts.Name, err)
 		}
 	}
-	return my.db, nil
+	my.db.Store(gdb)
+	return gdb, nil
 }
 
-// Connect 建立数据库连接。sync.Once 保证只执行一次；失败时每 10 秒重试，Logger 输出重试日志。
-// ctx 传入 Logger，便于结构化字段与测试；重试间隔固定为 10s（与 ctx 是否取消无关）。
+// Connect 建立数据库连接。sync.Once 保证只触发一次：成功或失败都立即返回，
+// 失败时交给重试协程，该协程永不退出，每 10s 重试一次直到连上。
 //
-// Establishes DB connection. sync.Once ensures single execution; retries every 10s on failure.
-// ctx is passed to Logger for structured fields and tests; retry interval is fixed at 10s.
+// 重试不能骑在调用方身上：调用方通常是 HTTP 请求，把"永不退出的重试循环"放进 once.Do
+// 会让请求（以及所有并发调用方，它们阻塞在 Do 上）永久挂起。重试协程与调用方解耦后，
+// 调用方立即拿到实例（成功即可用，失败则带 .Error），恢复由重试协程完成。
+//
+// Establishes the connection. sync.Once runs the first attempt once and returns immediately
+// either way; on failure a retry goroutine keeps trying every 10s until it succeeds, so the
+// caller is never blocked by an unbounded retry loop.
 func (my *db) Connect(ctx context.Context) *db {
 	my.once.Do(func() {
-		for {
-			var err error
-			if _, err = my.OpenDB(ctx); err == nil {
-				my.opts.Log.Info(ctx, "db connected", "name", my.opts.Name)
-				return
-			}
+		if _, err := my.OpenDB(ctx); err != nil {
+			// 错误已由 OpenDB 挂到实例上，调用方通过 .Error 拿到；这里转后台继续重试。
 			my.opts.Log.Error(ctx, "connect db error", "name", my.opts.Name, "url", my.opts.URL, "err", err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(10 * time.Second):
-			}
+			go my.retry()
+			return
 		}
+		my.opts.Log.Info(ctx, "db connected", "name", my.opts.Name)
 	})
 	return my
+}
+
+// retry 后台重试建连：每 10s 一次，失败只记日志，直到成功才退出。
+// Retries in the background every 10s; never gives up until the connection succeeds.
+func (my *db) retry() {
+	ctx := context.Background()
+	for {
+		time.Sleep(10 * time.Second)
+		if _, err := my.OpenDB(ctx); err != nil {
+			my.opts.Log.Error(ctx, "connect db error", "name", my.opts.Name, "url", my.opts.URL, "err", err)
+			continue
+		}
+		my.opts.Log.Info(ctx, "db connected", "name", my.opts.Name)
+		return
+	}
 }
 
 // Close 关闭底层连接池（*sql.DB）。未 Open 或 my.db 为 nil 时视为无需关闭。
 // Closes the underlying sql.DB pool. No-op when not opened or my.db is nil.
 func (my *db) Close() error {
-	if my.db == nil {
+	g := my.db.Load()
+	if g == nil {
 		return nil
 	}
-	db, err := my.db.DB()
+	db, err := g.DB()
 	if err != nil {
 		return err
 	}
@@ -370,20 +417,28 @@ func (my *db) Close() error {
 // DB 返回带 context 的 GORM 实例，支持请求超时与取消。
 // Returns context-aware GORM instance for timeout and cancellation.
 func (my *db) DB(ctx context.Context) *gorm.DB {
-	return my.db.WithContext(ctx)
+	g := my.db.Load()
+	if g == nil {
+		return nil
+	}
+	return g.WithContext(ctx)
 }
 
 // WithDB 注入 GORM 实例，用于单测或 mock 替换。
 // Injects GORM instance for testing or mocking.
 func (my *db) WithDB(db *gorm.DB) *db {
-	my.db = db
+	my.db.Store(db)
 	return my
 }
 
 // GetDB 主入口：懒连接后返回带 context 的 *gorm.DB。业务层应通过 db.GetDB(ctx, name) 调用。
+// 建连固定使用内部 ctx：调用方 ctx 多为 HTTP 请求，一旦取消，once 已消耗而重试还没起来，
+// 实例会被永久留在失败态。
 // Main entry: lazy-connects and returns context-aware *gorm.DB. Call via db.GetDB(ctx, name).
+// Connecting always uses an internal ctx: the caller's ctx is usually an HTTP request and must
+// not be able to abort the connect/retry flow.
 func (my *db) GetDB(ctx context.Context) *gorm.DB {
-	return my.Connect(ctx).DB(ctx)
+	return my.Connect(context.Background()).DB(ctx)
 }
 
 // CreateOrUpdate 预留接口，当前未实现。用于 upsert 等场景。
