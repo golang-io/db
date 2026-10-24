@@ -64,6 +64,15 @@ type DBLogger struct {
 	LongQueryTime time.Duration   // 慢查询阈值，超过打 SLOW 前缀 / Slow query threshold for SLOW prefix
 }
 
+// NewDBLogger 创建一个 DBLogger 实例。
+func NewDBLogger(output Output, level logger.LogLevel, longQueryTime time.Duration) *DBLogger {
+	return &DBLogger{
+		output:        output,
+		LogLevel:      level,
+		LongQueryTime: longQueryTime,
+	}
+}
+
 // gormFiles GORM 内部源文件名列表，getCallerInfo 在调用栈中跳过这些文件。
 // GORM internal source files; getCallerInfo skips these when walking call stack.
 var gormFiles = []string{

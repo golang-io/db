@@ -137,9 +137,11 @@ func GenMySQL(host string, port int, username, password, database, charset, loca
 // 示例 / Example: URL("mysql://user:pass@tcp(host:3306)/db") 或 URL("sqlite://:memory:")
 func URL(url string) Option {
 	return func(opts *Options) {
-		var ok bool
-		if opts.schema, opts.URL, ok = strings.Cut(url, "://"); !ok {
-			panic(fmt.Errorf("url must have scheme (sqlite:// or mysql://) and dsn is required: %s", url))
+		if schema, dsn, ok := strings.Cut(url, "://"); ok {
+			opts.schema = schema
+			opts.URL = dsn
+		} else {
+			opts.URL = url
 		}
 	}
 }
@@ -246,7 +248,8 @@ type db struct {
 	db        atomic.Pointer[gorm.DB] // GORM 实例，原子读写：后台重试协程替换实例，与并发读形成数据竞争 / GORM instance, read/written atomically: retry goroutine replaces it concurrently with business reads
 	opts      Options                 // 配置选项 / Options
 	once      sync.Once               // 保证首次建连只触发一次 / Ensures first connect runs once
-	dialector gorm.Dialector          // 驱动（mysql / sqlite） / Driver
+	dialector gorm.Dialector          // 驱动（mysql / sqlite / clickhouse 等） / Driver
+	driver    Driver                  // 注册的驱动接口与生命周期钩子 / Registered driver hooks
 }
 
 // markError 给建连失败得到的实例补齐 Statement 并挂上错误，供调用方安全使用。
@@ -315,8 +318,10 @@ func (my *db) OpenDB(ctx context.Context) (*gorm.DB, error) {
 		},
 	}
 
-	// ClickHouse 不能跳过默认事务，否则无法插入数据 / ClickHouse requires default transaction for inserts
-	if my.opts.schema == "clickhouse" {
+	// 方言驱动配置定制（如 ClickHouse 不能跳过默认事务，否则无法插入数据）
+	if my.driver.Config != nil {
+		my.driver.Config(config)
+	} else if my.opts.schema == "clickhouse" {
 		config.SkipDefaultTransaction = false
 	}
 
@@ -353,7 +358,12 @@ func (my *db) OpenDB(ctx context.Context) (*gorm.DB, error) {
 		return nil, openErr("ping db error: name=%s, %w", my.opts.Name, err)
 	}
 
-	if my.opts.schema == "sqlite" && my.opts.URL != ":memory:" {
+	// 方言驱动建立连接后的回调钩子（如 SQLite 开启 WAL）
+	if my.driver.PostOpen != nil {
+		if err := my.driver.PostOpen(gdb, my.opts.URL); err != nil {
+			return nil, openErr("post open db error: name=%s, %w", my.opts.Name, err)
+		}
+	} else if my.opts.schema == "sqlite" && my.opts.URL != ":memory:" {
 		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
 			return nil, openErr("set journal mode error: name=%s, %w", my.opts.Name, err)
 		}
