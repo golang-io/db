@@ -1,43 +1,47 @@
 // Package mysql 提供 MySQL 驱动接入。
 //
-// 只要引入该包（如 `_ "github.com/golang-io/db/mysql"`），就会自动向 db 注册 "mysql" scheme。
+// 引入该包（如 `_ "github.com/golang-io/db/mysql"`）会自动向 db 注册 "mysql" scheme。
 package mysql
 
 import (
 	"context"
-	"strings"
 
+	gomysql "github.com/go-sql-driver/mysql"
 	"github.com/golang-io/db"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
 func init() {
-	db.Register("mysql", db.Driver{
-		Dialector: mysql.Open,
+	db.Register("mysql", func(dsn string, opts *db.Options) (gorm.Dialector, error) {
+		cfg, err := gomysql.ParseDSN(dsn)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Timeout == 0 {
+			cfg.Timeout = max(opts.DialTimeout, 0)
+		}
+		if cfg.ReadTimeout == 0 {
+			cfg.ReadTimeout = max(opts.ReadTimeout, 0)
+		}
+		if cfg.WriteTimeout == 0 {
+			cfg.WriteTimeout = max(opts.WriteTimeout, 0)
+		}
+		return mysql.New(mysql.Config{DSNConfig: cfg}), nil
 	})
 }
 
-// Dialector 返回 MySQL 方言驱动。
+// Dialector 返回 MySQL 方言驱动，超时需在 DSN 中配置。
 func Dialector(dsn string) gorm.Dialector {
 	return mysql.Open(dsn)
 }
 
-// Open 立即打开 MySQL 连接并返回 *gorm.DB，不向全局 dbm 注册。
-// 适用于纯函数式、显式持有 *gorm.DB 实例的场景。
+// Open 立即打开 MySQL 连接，不注册全局实例；调用方负责关闭。
 func Open(ctx context.Context, options db.Options) (*gorm.DB, error) {
-	opts := options
-	if !strings.Contains(opts.URL, "://") {
-		opts.URL = "mysql://" + opts.URL
-	}
-	return db.OpenURL(ctx, opts)
+	return db.OpenDB(ctx, options.WithScheme("mysql"))
 }
 
-// New 创建 MySQL 连接并注册到全局 dbm。
+// New 登记 MySQL 托管实例。首次 GetDB 时开始拨号，还没连上就等待。
 func New(options db.Options) error {
-	opts := options
-	if !strings.Contains(opts.URL, "://") {
-		opts.URL = "mysql://" + opts.URL
-	}
-	return db.CreateDB(opts)
+	return db.CreateDB(options.WithScheme("mysql"))
 }

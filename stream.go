@@ -5,26 +5,59 @@
 //   - Stream:      逐行流式处理，每行回调 handle(index, row)
 //   - StreamBatch: 分批流式处理，每 batch 行回调 fun(rows)
 //   - Query:       基于 StreamBatch 的便捷查询，返回所有结果
+//
+// 列值类型由驱动决定（如 int64、float64、time.Time），NULL 为 nil，[]byte 转为 string。
 package db
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"slices"
-	"strconv"
-	"strings"
-	"time"
-	"unsafe"
 )
 
+// queryRows 按实例名获取原生 *sql.DB 并执行查询。实例未注册时返回 error，不 panic。
+// 还没连上时停在 GetDB，直到连上；实例已 Close 时 GetDB 不再返回。
+func queryRows(ctx context.Context, name, query string, args []any) (*sql.Rows, error) {
+	in, ok := dbm[name]
+	if !ok {
+		return nil, fmt.Errorf("db %q not found", name)
+	}
+	g := in.GetDB(ctx)
+	sqlDB, err := g.DB()
+	if err != nil {
+		return nil, fmt.Errorf("get db: %w", err)
+	}
+	rows, err := sqlDB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query rows: %w", err)
+	}
+	return rows, nil
+}
+
+// scanRow 扫描当前行到 []any，[]byte 转为 string（同时完成拷贝，避免驱动缓冲区复用）。
+func scanRow(rows *sql.Rows, n int) ([]any, error) {
+	values, ptrs := make([]any, n), make([]any, n)
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return nil, err
+	}
+	for i, v := range values {
+		if b, ok := v.([]byte); ok {
+			values[i] = string(b)
+		}
+	}
+	return values, nil
+}
+
 // Stream 逐行流式查询，对每一行调用 handle 回调。
-// 使用原生 database/sql 接口绕过 GORM，每行数据根据列的 Go 类型自动格式转换。
+// 使用原生 database/sql 接口绕过 GORM。
 //
 // 参数:
 //   - ctx:    上下文，支持超时与取消
-//   - name:   数据库实例名（已通过 NewMySQL/NewSQLite 等注册）
+//   - name:   数据库实例名（已通过 CreateDB 等注册）
 //   - query:  SQL 查询语句
 //   - args:   参数化查询的参数（防止 SQL 注入）
 //   - handle: 回调函数，index 为当前行号（从 1 开始），row 为该行各列的值
@@ -37,41 +70,24 @@ import (
 //	        return nil
 //	    })
 func Stream(ctx context.Context, name string, query string, args []any, handle func(index int64, row []any) error) (int64, error) {
-	tx, err := GetDB(ctx, name).DB()
+	rows, err := queryRows(ctx, name, query, args)
 	if err != nil {
-		return 0, fmt.Errorf("get db: %w", err)
-	}
-
-	rows, err := tx.QueryContext(ctx, query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("query rows: %w", err)
+		return 0, err
 	}
 	defer rows.Close()
 
-	types, err := rows.ColumnTypes()
+	columns, err := rows.Columns()
 	if err != nil {
-		return 0, fmt.Errorf("column types: %w", err)
+		return 0, fmt.Errorf("columns: %w", err)
 	}
 
-	// v 存原始字节，scans 存指针供 Scan 使用
-	cnt, v, scans := int64(0), make([]sql.RawBytes, len(types)), make([]any, len(types))
-	for i := range v {
-		scans[i] = &v[i]
-	}
-
+	var cnt int64
 	for rows.Next() {
-		if err = rows.Scan(scans...); err != nil {
-			return 0, fmt.Errorf("rows scan: %w", err)
+		row, err := scanRow(rows, len(columns))
+		if err != nil {
+			return cnt, fmt.Errorf("rows scan: %w", err)
 		}
-		cnt += 1
-		row := make([]any, len(v))
-
-		for i := range v {
-			if row[i], err = format(*(*string)(unsafe.Pointer(&v[i])), types[i].ScanType().Name()); err != nil {
-				fmt.Println(pErr(types[i].Name(), types[i].ScanType().Name(), v[i], v, err))
-			}
-		}
-
+		cnt++
 		if err = handle(cnt, row); err != nil {
 			return cnt, err
 		}
@@ -79,58 +95,9 @@ func Stream(ctx context.Context, name string, query string, args []any, handle f
 	return cnt, rows.Err()
 }
 
-// pErr 构造列解析错误信息，包含列名、类型、原始值等调试信息。
-func pErr(name, kind string, v sql.RawBytes, row any, err error) error {
-	return fmt.Errorf("name=%s, kind=%s, v=%s, row=%#v, err=%w", name, kind, v, row, err)
-}
-
-// format 根据 Go 类型名称将原始字符串值转换为对应的 Go 原生类型。
-// 这是流式查询的核心类型转换函数，负责将 sql.RawBytes 的字符串表示
-// 转为 string、int、float64、time.Time 或 bool。
-//
-// 类型映射:
-//   - "RawBytes", "string", "NullString" → string（克隆，避免底层缓冲区复用）
-//   - "NullInt64", "uint8"..."int64"     → int64（空串返回 0）
-//   - "NullTime"                         → *time.Time（零值/空串返回零时间）
-//   - "float64"                          → float64
-//   - "bool"                             → bool
-func format(s, format string) (any, error) {
-	switch format {
-	case "RawBytes", "string", "NullString":
-		// 克隆字符串，因为 sql.RawBytes 底层缓冲区会被后续 Scan 复用
-		return strings.Clone(s), nil
-	case "NullInt64", "uint8", "uint32", "uint64", "int", "int8", "int32", "int64":
-		if s == "" {
-			return 0, nil
-		}
-		return strconv.ParseInt(s, 10, 64)
-	case "NullTime":
-		if s == "0001-01-01T00:00:00Z" || s == "" {
-			return &time.Time{}, nil
-		}
-		// 尝试多种时间格式：RFC3339（ISO 8601）、MySQL DateTime
-		for _, layout := range []string{time.RFC3339, time.DateTime, "2006-01-02T15:04:05"} {
-			if t, err := time.Parse(layout, s); err == nil {
-				return &t, nil
-			}
-		}
-		// 最后用 Local 时区尝试 DateTime 格式
-		t, err := time.ParseInLocation(time.DateTime, s, time.Local)
-		if err != nil {
-			return nil, err
-		}
-		return &t, nil
-	case "float64":
-		return strconv.ParseFloat(s, 64)
-	case "bool":
-		return strconv.ParseBool(s)
-	default:
-		return nil, fmt.Errorf("format unknown, format=%s", format)
-	}
-}
-
 // StreamBatch 分批流式查询，每积累 batch 行后调用一次 fun 回调。
 // 结果组织为 []map[string]any（列名→值），适合批量插入、批量发送等场景。
+// 列名重复时直接返回错误，需使用唯一列别名。
 // 最后不足 batch 的剩余行也会触发一次回调。
 //
 // 参数:
@@ -138,7 +105,7 @@ func format(s, format string) (any, error) {
 //   - name:  数据库实例名
 //   - query: SQL 查询语句
 //   - args:  参数化查询的参数
-//   - batch: 每批处理的行数
+//   - batch: 每批处理的行数，必须大于 0
 //   - fun:   批处理回调函数，接收当前批次的所有行数据
 //
 // 返回处理的总行数和错误。
@@ -148,14 +115,12 @@ func format(s, format string) (any, error) {
 //	        return bulkInsert(rows)
 //	    })
 func StreamBatch(ctx context.Context, name, query string, args []any, batch int, fun func(rows []map[string]any) error) (int64, error) {
-	tx, err := GetDB(ctx, name).DB()
-	if err != nil {
-		return 0, fmt.Errorf("get db: %w", err)
+	if batch <= 0 {
+		return 0, fmt.Errorf("batch must be > 0, got %d", batch)
 	}
-
-	rows, err := tx.QueryContext(ctx, query, args...)
+	rows, err := queryRows(ctx, name, query, args)
 	if err != nil {
-		return 0, fmt.Errorf("query rows: %w", err)
+		return 0, err
 	}
 	defer rows.Close()
 
@@ -163,29 +128,25 @@ func StreamBatch(ctx context.Context, name, query string, args []any, batch int,
 	if err != nil {
 		return 0, fmt.Errorf("columns: %w", err)
 	}
-
-	types, err := rows.ColumnTypes()
-	if err != nil {
-		return 0, fmt.Errorf("column types: %w", err)
+	seen := make(map[string]struct{}, len(columns))
+	for _, col := range columns {
+		if _, exists := seen[col]; exists {
+			return 0, fmt.Errorf("duplicate column name %q: use unique column aliases", col)
+		}
+		seen[col] = struct{}{}
 	}
 
-	cnt, v, scans := int64(0), make([]sql.RawBytes, len(types)), make([]any, len(types))
-	for i := range v {
-		scans[i] = &v[i]
-	}
-
+	var cnt int64
 	batchs := make([]map[string]any, 0, batch)
 	for rows.Next() {
-		if err = rows.Scan(scans...); err != nil {
-			return 0, fmt.Errorf("rows scan: %w", err)
+		values, err := scanRow(rows, len(columns))
+		if err != nil {
+			return cnt, fmt.Errorf("rows scan: %w", err)
 		}
-		cnt += 1
-		row := make(map[string]any, len(v))
-
-		for i := range v {
-			if row[columns[i]], err = format(*(*string)(unsafe.Pointer(&v[i])), types[i].ScanType().Name()); err != nil {
-				log.Printf("%s", pErr(types[i].Name(), types[i].ScanType().Name(), v[i], v, err))
-			}
+		cnt++
+		row := make(map[string]any, len(columns))
+		for i, col := range columns {
+			row[col] = values[i]
 		}
 		batchs = append(batchs, row)
 
@@ -199,7 +160,7 @@ func StreamBatch(ctx context.Context, name, query string, args []any, batch int,
 	}
 
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("rows err: %w", err)
+		return cnt, fmt.Errorf("rows err: %w", err)
 	}
 
 	// 处理最后不足一批的剩余行

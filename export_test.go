@@ -1,23 +1,18 @@
 package db
 
-import "gorm.io/gorm"
+import (
+	"time"
 
-// SetupForTest 暴露 setup 给测试包使用
-func SetupForTest(options Options, opts ...Option) *db {
-	return setup(options, opts...)
+	"gorm.io/gorm"
+)
+
+// NewForTest 用指定 dialector 创建托管实例（补齐默认值，不注册），供测试包注入失败的 dialector。
+func NewForTest(opts Options, d gorm.Dialector) *instance {
+	return newInstance(opts.withDefaults(), d)
 }
 
-// OpenForTest 暴露 my.open 给测试包使用
-func (my *db) OpenForTest(f func(dsn string) gorm.Dialector) error {
-	return my.open(f)
-}
-
-// DialectorForTest 暴露 my.dialector 给测试包使用
-func (my *db) DialectorForTest() gorm.Dialector {
-	return my.dialector
-}
-
-// SetDialectorForTest 暴露 my.dialector 注入给测试包使用
-func (my *db) SetDialectorForTest(d gorm.Dialector) {
-	my.dialector = d
+// WithRetry 修改后台重试间隔，须在首次 GetDB 之前调用。仅供测试使用。
+func (in *instance) WithRetry(d time.Duration) *instance {
+	in.retry = d
+	return in
 }
