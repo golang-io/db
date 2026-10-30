@@ -106,7 +106,7 @@ URL 去掉 `sqlite://` 后就是 DSN，有两种形式：
   - `ConnMaxLifeTime`、`ConnMaxIdleTime` 设为 `-1`（连接永不回收），手动设置的值会被忽略；
   - 私有内存库的 `MaxOpenConns` 设为 1，手动设置的值会被忽略。
 - "不回收"在连接池内部为 `0s`：`database/sql` 把 0 和负数都存为 0，表示不限时。
-- `MaxIdleConns` 不处理，不要设为负数，否则连接用完即关，内存库会在每次查询后丢失。
+- 内存库的 `MaxIdleConns` 至少为 1，零值或负值会被修正，避免连接用完即关导致内存库丢失；文件库保留调用方的配置。
 - 私有内存库只有一个连接：在 `Stream` / `StreamBatch` 回调里再用 `GetDB` 查同一个库，或在事务里不用 `tx` 而另外调用 `GetDB`，都会永久阻塞。需要嵌套请用 memdb。
 - `_txlock=immediate` 让所有事务串行，只读事务也一样；事务外的读仍可并发，开启 WAL 后读与写互不阻塞。
 - WAL 不会自动开启，需要时在 DSN 中写 `_pragma=journal_mode(WAL)`。它会永久写入数据库文件，且不适用于网络文件系统。

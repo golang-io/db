@@ -28,6 +28,7 @@ func (m Migrator) CurrentDatabase() (name string) {
 }
 
 // CreateTable 建表；AutoIncrement 列用 SEQUENCE + DEFAULT nextval（DuckDB 无可用 IDENTITY）。
+// 具体默认值优先；空默认值或 default:(-) 使用自动序列。
 // 序列名直接拼接到 SQL，自增列所在表名、列名只允许字母、数字和下划线。
 func (m Migrator) CreateTable(values ...interface{}) error {
 	for _, value := range m.ReorderModels(values, false) {
@@ -39,7 +40,7 @@ func (m Migrator) CreateTable(values ...interface{}) error {
 
 			// 先为自增列建序列，再 CREATE TABLE。
 			for _, field := range stmt.Schema.Fields {
-				if field.AutoIncrement {
+				if field.AutoIncrement && (field.DefaultValue == "" || field.DefaultValue == "(-)") {
 					name := seqName(stmt.Table, field.DBName)
 					if strings.ContainsFunc(name, func(r rune) bool {
 						return r != '_' && !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9')
@@ -65,7 +66,7 @@ func (m Migrator) CreateTable(values ...interface{}) error {
 				}
 				createTableSQL += "? ?"
 				colType := m.DB.Migrator().FullDataTypeOf(field)
-				if field.AutoIncrement {
+				if field.AutoIncrement && (field.DefaultValue == "" || field.DefaultValue == "(-)") {
 					// DEFAULT nextval('table_col_seq')；RETURNING 可取回新 id（LastInsertId 不可靠）。
 					colType.SQL += " DEFAULT nextval('" + seqName(stmt.Table, field.DBName) + "')"
 				}
@@ -171,7 +172,38 @@ func (m Migrator) HasColumn(value interface{}, field string) bool {
 	return count > 0
 }
 
-// ColumnTypes 补齐驱动未提供的默认值元数据，避免重复迁移误判为改列。
+// AddColumn 支持新增列时声明 UNIQUE；拒绝新增自增列，普通字段沿用 GORM。
+func (m Migrator) AddColumn(value interface{}, name string) error {
+	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
+		if stmt.Schema != nil {
+			if field := stmt.Schema.LookUpField(name); field != nil && !field.IgnoreMigration {
+				if field.AutoIncrement {
+					return fmt.Errorf("duckdb: AddColumn auto increment field=%s: %w", field.DBName, ErrNotSupport)
+				}
+				if field.Unique {
+					columnType := m.DB.Migrator().FullDataTypeOf(field)
+					columnType.SQL += " UNIQUE"
+					return m.DB.Exec("ALTER TABLE ? ADD ? ?", m.CurrentTable(stmt), clause.Column{Name: field.DBName}, columnType).Error
+				}
+			}
+		}
+		return m.Migrator.AddColumn(value, name)
+	})
+}
+
+// MigrateColumn 补齐非主键自增字段的预期默认值，保留其余比较。
+func (m Migrator) MigrateColumn(value interface{}, field *schema.Field, columnType gorm.ColumnType) error {
+	if field.IgnoreMigration || field.PrimaryKey || !field.AutoIncrement || (field.DefaultValue != "" && field.DefaultValue != "(-)") {
+		return m.Migrator.MigrateColumn(value, field, columnType)
+	}
+	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
+		normalized := *field
+		normalized.DefaultValue = fmt.Sprintf("nextval('%s')", seqName(stmt.Table, field.DBName))
+		return m.Migrator.MigrateColumn(value, &normalized, columnType)
+	})
+}
+
+// ColumnTypes 补齐驱动未提供的默认值和单列唯一约束元数据。
 func (m Migrator) ColumnTypes(value any) ([]gorm.ColumnType, error) {
 	columnTypes, err := m.Migrator.ColumnTypes(value)
 	if err != nil {
@@ -181,15 +213,25 @@ func (m Migrator) ColumnTypes(value any) ([]gorm.ColumnType, error) {
 		var columns []struct {
 			ColumnName    string
 			ColumnDefault sql.NullString
+			IsUnique      bool
 		}
 		if err := m.DB.Raw(
-			`SELECT column_name, column_default FROM duckdb_columns()
-			 WHERE database_name = current_database() AND schema_name = current_schema() AND table_name = ?`,
+			`SELECT c.column_name, c.column_default,
+			 EXISTS (
+			   SELECT 1 FROM duckdb_constraints() k
+			   WHERE k.database_name = c.database_name AND k.schema_name = c.schema_name
+			     AND k.table_name = c.table_name AND k.constraint_type = 'UNIQUE'
+			     AND len(k.constraint_column_names) = 1
+			     AND k.constraint_column_names[1] = c.column_name
+			 ) AS is_unique
+			 FROM duckdb_columns() c
+			 WHERE c.database_name = current_database() AND c.schema_name = current_schema() AND c.table_name = ?`,
 			stmt.Table,
 		).Scan(&columns).Error; err != nil {
 			return err
 		}
 		defaults := make(map[string]sql.NullString, len(columns))
+		unique := make(map[string]bool, len(columns))
 		for _, column := range columns {
 			dv := column.ColumnDefault
 			if strings.EqualFold(dv.String, "NULL") {
@@ -198,15 +240,35 @@ func (m Migrator) ColumnTypes(value any) ([]gorm.ColumnType, error) {
 				dv.String = strings.ReplaceAll(dv.String[1:len(dv.String)-1], "''", "'")
 			}
 			defaults[column.ColumnName] = dv
+			unique[column.ColumnName] = column.IsUnique
 		}
 		for i, column := range columnTypes {
 			ct := column.(migrator.ColumnType)
 			ct.DefaultValueValue = defaults[ct.Name()]
+			if isUnique, known := unique[ct.Name()]; known {
+				ct.UniqueValue = sql.NullBool{Bool: isUnique, Valid: true}
+			}
 			columnTypes[i] = ct
 		}
 		return nil
 	})
 	return columnTypes, err
+}
+
+// MigrateColumnUnique 保留已有单列唯一约束；变更需显式迁移，不能静默跳过。
+// 组合唯一约束与独立唯一索引不属于字段的 unique 标签。
+func (m Migrator) MigrateColumnUnique(value interface{}, field *schema.Field, columnType gorm.ColumnType) error {
+	if field.PrimaryKey {
+		return nil
+	}
+	actual, known := columnType.Unique()
+	if !known {
+		return fmt.Errorf("duckdb: unique metadata unavailable for column %q", field.DBName)
+	}
+	if actual == field.Unique {
+		return nil
+	}
+	return fmt.Errorf("duckdb: changing UNIQUE on column %q requires explicit migration: %w", field.DBName, ErrNotSupport)
 }
 
 // AlterColumn P0 不支持改列类型（DuckDB ALTER 能力有限，避免半迁移）。

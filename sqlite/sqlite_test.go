@@ -189,7 +189,7 @@ func TestSQLiteMemoryDefaults(t *testing.T) {
 				for _, explicit := range []bool{false, true} {
 					t.Run(fmt.Sprintf("%s/explicit=%v", prefix, explicit), func(t *testing.T) {
 						opts := db.Options{URL: prefix + dsn}
-						wantMax, wantLife, wantIdle := 50, 5*time.Minute, time.Minute
+						wantMax, wantLife, wantIdle := 50, time.Hour, 10*time.Minute
 						if explicit {
 							opts.MaxOpenConns, opts.ConnMaxLifeTime, opts.ConnMaxIdleTime = 3, 2*time.Minute, 3*time.Minute
 							wantMax, wantLife, wantIdle = 3, 2*time.Minute, 3*time.Minute
@@ -239,6 +239,71 @@ func TestSQLiteMemoryDefaults(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSQLiteMemoryRetainsIdleConnection 内存库至少保留一个空闲连接，避免连接归还时销毁数据库
+func TestSQLiteMemoryRetainsIdleConnection(t *testing.T) {
+	for _, kind := range []string{"private", "shared", "file"} {
+		for _, entry := range []string{"OpenDB", "CreateDB"} {
+			for _, config := range []string{"zero option", "negative struct"} {
+				t.Run(kind+"/"+entry+"/"+config, func(t *testing.T) {
+					ctx := context.Background()
+					// private 保持独立内存库 :memory:；shared 用 memdb 在连接间共享；file 落到临时文件。
+					dsn := ":memory:"
+					switch kind {
+					case "shared":
+						dsn = fmt.Sprintf("file:/keepalive-%d?vfs=memdb", time.Now().UnixNano())
+					case "file":
+						dsn = filepath.Join(t.TempDir(), "app.db")
+					}
+					opts := db.Options{Name: t.TempDir(), URL: "sqlite://" + dsn, LogLevel: logger.Silent}
+					var overrides []db.Option
+					if config == "zero option" {
+						overrides = append(overrides, db.MaxIdleConns(0))
+					} else {
+						opts.MaxIdleConns = -1
+					}
+					var g *gorm.DB
+					var err error
+					if entry == "OpenDB" {
+						g, err = db.OpenDB(ctx, opts, overrides...)
+					} else {
+						err = db.CreateDB(opts, overrides...)
+						if err == nil {
+							t.Cleanup(func() { _ = db.Get(opts.Name).Close() })
+							g = db.GetDB(ctx, opts.Name)
+						}
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					pool, err := g.DB()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if entry == "OpenDB" {
+						t.Cleanup(func() { _ = pool.Close() })
+					}
+					for _, query := range []string{"CREATE TABLE t(id INTEGER)", "INSERT INTO t VALUES (42)"} {
+						if err := g.Exec(query).Error; err != nil {
+							t.Fatalf("%s: %v", query, err)
+						}
+					}
+					var n int
+					if err := g.Raw("SELECT id FROM t").Scan(&n).Error; err != nil || n != 42 {
+						t.Fatalf("query: value=%d, err=%v", n, err)
+					}
+					wantIdle := 1
+					if kind == "file" {
+						wantIdle = 0
+					}
+					if got := pool.Stats().Idle; got != wantIdle {
+						t.Fatalf("idle connections=%d, want %d", got, wantIdle)
+					}
+				})
+			}
+		}
 	}
 }
 

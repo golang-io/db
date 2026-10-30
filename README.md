@@ -36,7 +36,11 @@ go get github.com/golang-io/db
 
 子包和根包测试依赖 mysql / sqlite / duckdb 驱动，因此 `go.mod` 列出这些依赖；业务二进制只包含实际导入的驱动。
 
-DuckDB 子包自带迁移器，`AutoMigrate` 会为自增列自动创建序列；不支持改列类型、删除约束和重命名索引，这几项返回 `duckdb.ErrNotSupport`。DuckDB 不支持 `SAVEPOINT`，嵌套 `Transaction` 会返回 `gorm.ErrUnsupportedDriver`。
+DuckDB 子包自带迁移器，首次建表时会为自增列自动创建序列，支持非主键自增列的重复迁移。已有表新增自增列需要显式迁移，`AddColumn` / `AutoMigrate` 返回 `duckdb.ErrNotSupport`；普通列仍可自动添加。不支持改列类型、删除约束和重命名索引，这几项也返回 `duckdb.ErrNotSupport`。DuckDB 不支持 `SAVEPOINT`，嵌套 `Transaction` 会返回 `gorm.ErrUnsupportedDriver`。
+
+自增字段配置了具体 `default` 时，该默认值优先，本库不再为该字段创建自动序列；例如 `autoIncrement;default:7` 的默认插入值是 7，不会递增。未配置具体默认值或使用 `default:(-)` 时，仍由本库自动创建序列，并支持重复迁移。
+
+DuckDB 首次建表和新增列支持字段的 `gorm:"unique"`；新增列时唯一约束与列在同一条 SQL 中创建，若默认值使历史行出现重复，则加列失败，不会留下缺少约束的新列。已有表重复迁移会检查实际的单列唯一约束。给已有列增加或移除 `unique` 标签需要显式迁移，`AutoMigrate` 返回 `duckdb.ErrNotSupport`，不会自动重建表。组合唯一约束不等于各列分别唯一，`uniqueIndex` 仍走索引迁移路径。`AutoMigrate` 的其他变更可能在报错前已经执行，不保证整个迁移原子性。
 
 ## 快速开始
 
@@ -249,9 +253,10 @@ _ = sqlite.New(db.Options{Name: "cache", URL: "file:/cache?vfs=memdb"})
 
 - **连接池参数自动设置**：内存库的数据挂在连接上，最后一个连接关闭时整个库就被销毁；`:memory:` 每个连接打开的还是独立的空库。导入 `sqlite` 子包后，识别到内存库时（`db.CreateDB` / `db.OpenDB` / `sqlite.New` / `sqlite.Open` 行为一致）直接设置：
   - `ConnMaxLifeTime`、`ConnMaxIdleTime` 设为 `-1`（连接永不回收）；
+  - `MaxIdleConns` 至少为 1，零值或负值会被修正，避免最后一个连接归还时销毁内存库；
   - `:memory:` 等私有内存库的 `MaxOpenConns` 设为 1，因此无法并发查询，只适合单元测试。
 
-  这几项手动设置的值会被忽略。
+  连接回收时间和私有内存库的 `MaxOpenConns` 会被强制覆盖；`MaxIdleConns` 的正值会保留。
 - **`:memory:` 不要嵌套使用连接**：只有一个连接时，在 `Stream` / `StreamBatch` 回调里再用 `GetDB` 查同一个库，或在事务里不用 `tx` 而另外调用 `GetDB`，都会因为等不到连接而永久阻塞。需要嵌套请用 memdb。
 - **memdb 的名字必须以 `/` 开头**：`file:/cache` 才会在连接间共享；`file:cache` 是每个连接私有的库。
 - **memdb 写入是串行的**：SQLite 同一时刻只允许一个写入，写入时也会阻塞读；内存库不支持 WAL（设置了不报错，但不生效），无法做到读写互不阻塞。写入频繁的场景并发收益有限，可按业务需要通过 `_pragma=busy_timeout(毫秒数)` 调整锁等待时间，当前底层驱动默认值为 5000ms。
@@ -285,22 +290,26 @@ _ = sqlite.New(db.Options{Name: "cache", URL: "file:/cache?vfs=memdb"})
 |------|------|----------------------------|
 | `Name` | 实例名，用于 `GetDB` | `CreateDB` 必填；`OpenDB` / `Open` 为 `default` |
 | `URL` | 连接串 | 必填（`Open` 不使用） |
+| `MaskPassword` | URL 格式错误中的密码打码 | `false` |
 | `MaxIdleConns` / `MaxOpenConns` | 连接池 | 10 / 50 |
-| `ConnMaxLifeTime` | 连接最大存活时间（负数表示不回收） | 5m |
-| `ConnMaxIdleTime` | 连接最大空闲时间（回收被 MySQL/LB 静默关闭的空闲连接；负数表示不回收） | 1m |
+| `ConnMaxLifeTime` | 连接最大存活时间（负数表示不回收） | 1h |
+| `ConnMaxIdleTime` | 连接最大空闲时间（回收被 MySQL/LB 静默关闭的空闲连接；负数表示不回收） | 10m |
 | `DialTimeout` / `ReadTimeout` / `WriteTimeout` | 交给注册工厂应用的建连 / 读 / 写超时；MySQL 示例仅回填 DSN 的零值，负数取零 | 3s / 不设置 / 不设置 |
-| `LongQueryTime` | 慢查询阈值（日志 `SLOW:`） | 3s |
+| `LongQueryTime` | 慢查询阈值（日志 `SLOW:`） | 5s |
 | `Output` | SQL 日志 `io.Writer` | `os.Stdout` |
 | `Log` | 业务日志（连接、重试） | 空实现 |
 | `LogLevel` | GORM 日志级别 | `Warn` |
 
 零值字段使用默认值；负数按 `database/sql` 原生语义（不限制 / 不保留 / 不回收 / 不超时）。`Output`、`Log`、`LogLevel` 无 YAML 标签，适合在代码里注入。
 
+生产环境可设置 `Options.MaskPassword: true`，或传入 `db.MaskPassword(true)`。该选项用于本包 URL 格式错误中的连接串展示：密码保留首尾各 2 个字符，中间替换为 `**`，例如 `ab123456yz` 显示为 `ab**yz`；不超过 4 个字符的非空密码统一显示为 `**`。只在凭据边界明确的 MySQL DSN 中保留连接信息；格式不完整、含有歧义分隔符或无法可靠识别的输入整段显示为 `**`。传给驱动的连接串保持原样。显式传入 `db.MaskPassword(false)` 可覆盖配置中的开关。
+
 ## YAML 配置示例
 
 ```yaml
 Name: default
 URL: mysql://user:pass@tcp(127.0.0.1:3306)/mydb?charset=utf8mb4&parseTime=True&loc=Local
+MaskPassword: true
 MaxIdleConns: 50
 MaxOpenConns: 100
 ConnMaxLifeTime: 5m

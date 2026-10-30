@@ -34,6 +34,7 @@ func Dialector(dsn string) gorm.Dialector {
 //   - 事务：DSN 未指定 _txlock 时追加 _txlock=immediate，事务开始即拿写锁，避免多连接下"先读后写"的事务
 //     在升级写锁时直接报 database is locked（此时 busy_timeout 不生效）。事务外的读仍可并发。
 //   - 内存库：数据挂在连接上，最后一个连接关闭即销毁，所以连接永不回收。
+//     至少保留一个空闲连接，防止 MaxIdleConns <= 0 导致连接归还时销毁数据库。
 //   - 私有内存库（:memory:、未以 / 开头的 memdb 等）：每个连接各自一个库，所以只能单连接。
 func dialectorOf(dsn string, opts *db.Options) gorm.Dialector {
 	name, query, hasQuery := strings.Cut(dsn, "?")
@@ -66,6 +67,7 @@ func dialectorOf(dsn string, opts *db.Options) gorm.Dialector {
 		return d
 	}
 	opts.ConnMaxLifeTime, opts.ConnMaxIdleTime = -1, -1
+	opts.MaxIdleConns = max(opts.MaxIdleConns, 1)
 	if private {
 		opts.MaxOpenConns = 1
 	}

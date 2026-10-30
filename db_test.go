@@ -86,7 +86,44 @@ func TestDBLogger_RecordNotFound(t *testing.T) {
 	}
 }
 
-// TestDBLogger_Truncate 超长 SQL 先压缩空白再截断，且不截断多字节字符
+func TestDBLogger_PreservesSQLSemantics(t *testing.T) {
+	var output bytes.Buffer
+	g, err := db.Open(context.Background(), sqlite.Open(":memory:"), db.Options{
+		Output: &output, LogLevel: logger.Info, MaxOpenConns: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := g.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+	for _, tt := range []struct{ name, query string }{
+		{"literal spaces", "SELECT 'a  b'"},
+		{"line comment", "SELECT 1 -- comment\n+ 1 AS n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			output.Reset()
+			var actual, replay any
+			if err := g.Raw(" \n\t" + tt.query + " \n").Row().Scan(&actual); err != nil {
+				t.Fatal(err)
+			}
+			parts := strings.SplitN(output.String(), " | ", 3)
+			if len(parts) != 3 {
+				t.Fatalf("unexpected SQL log: %q", output.String())
+			}
+			if err := pool.QueryRow(parts[2]).Scan(&replay); err != nil {
+				t.Fatalf("execute logged SQL: %v", err)
+			}
+			if !reflect.DeepEqual(actual, replay) {
+				t.Fatalf("query result=%#v, logged SQL result=%#v", actual, replay)
+			}
+		})
+	}
+}
+
+// TestDBLogger_Truncate 超长 SQL 截断时不截断多字节字符。
 func TestDBLogger_Truncate(t *testing.T) {
 	var buf bytes.Buffer
 	dl := db.NewDBLogger(log.New(&buf, "", 0), logger.Info, time.Second)
@@ -175,6 +212,61 @@ func TestCreateDB_Duplicate(t *testing.T) {
 	}
 	if err := db.CreateDB(db.Options{URL: "sqlite://:memory:"}); err == nil {
 		t.Fatal("expect name required error")
+	}
+}
+
+// TestCreateDB_NameOptions 名称由结构体与 Option 共同决定，Option 后应用；最终名为空则报错
+func TestCreateDB_NameOptions(t *testing.T) {
+	for _, tt := range []struct {
+		name, original, override string
+		applyOverride, wantError bool
+	}{
+		{name: "struct", original: "struct"},
+		{name: "option", override: "option", applyOverride: true},
+		{name: "override", original: "original", override: "override", applyOverride: true},
+		{name: "missing", wantError: true},
+		{name: "empty override", original: "original", applyOverride: true, wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := db.Options{URL: "sqlite://:memory:"}
+			if tt.original != "" {
+				opts.Name = uniq(tt.original)
+			}
+			wantName := opts.Name
+			var overrides []db.Option
+			calls := 0
+			if tt.applyOverride {
+				wantName = tt.override
+				if wantName != "" {
+					wantName = uniq(wantName)
+				}
+				overrides = append(overrides, func(o *db.Options) {
+					calls++
+					o.Name = wantName
+				})
+			}
+			err := db.CreateDB(opts, overrides...)
+			if tt.applyOverride && calls != 1 {
+				t.Fatalf("option called %d times, want 1", calls)
+			}
+			if tt.wantError {
+				if err == nil || !strings.Contains(err.Error(), "name is required") {
+					t.Fatalf("want name required error, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := db.Get(wantName)
+			t.Cleanup(func() { _ = in.Close() })
+			if in.Name() != wantName {
+				t.Fatalf("registered name=%q, want %q", in.Name(), wantName)
+			}
+			if err := db.CreateDB(db.Options{Name: uniq("other"), URL: opts.URL}, db.Name(wantName)); err == nil {
+				t.Fatal("duplicate final name must be rejected")
+			}
+		})
 	}
 }
 
@@ -346,6 +438,56 @@ func TestOpen_WithoutRegister(t *testing.T) {
 	}
 }
 
+// TestOpen_NameDefaults Open / OpenDB 的名称为空时回落到 default，Option 覆盖结构体
+func TestOpen_NameDefaults(t *testing.T) {
+	for _, tt := range []struct {
+		name, original, override, want string
+		applyOverride                  bool
+	}{
+		{name: "default", want: "default"},
+		{name: "struct", original: "original", want: "original"},
+		{name: "option", original: "original", override: "override", want: "override", applyOverride: true},
+		{name: "empty option", original: "original", want: "default", applyOverride: true},
+	} {
+		for _, entry := range []string{"Open", "OpenDB"} {
+			t.Run(entry+"/"+tt.name, func(t *testing.T) {
+				opts := db.Options{Name: tt.original, LogLevel: logger.Silent}
+				var overrides []db.Option
+				calls := 0
+				if tt.applyOverride {
+					overrides = append(overrides, func(o *db.Options) {
+						calls++
+						o.Name = tt.override
+					})
+				}
+				probe := &configProbeDialector{customDialector: customDialector{sqlite.Open(":memory:"), "sqlite"}}
+				if entry == "OpenDB" {
+					scheme := uniq("name-probe")
+					db.Register(scheme, func(_ string, o *db.Options) (gorm.Dialector, error) {
+						if o.Name != tt.want {
+							t.Errorf("factory name=%q, want %q", o.Name, tt.want)
+						}
+						return probe, nil
+					})
+					opts.URL = scheme + "://probe"
+				}
+				var err error
+				if entry == "Open" {
+					_, err = db.Open(context.Background(), probe, opts, overrides...)
+				} else {
+					_, err = db.OpenDB(context.Background(), opts, overrides...)
+				}
+				if !errors.Is(err, errConfigProbe) || !strings.Contains(err.Error(), "name="+tt.want+",") {
+					t.Fatalf("want probe error with name %q, got %v", tt.want, err)
+				}
+				if tt.applyOverride && calls != 1 {
+					t.Fatalf("option called %d times, want 1", calls)
+				}
+			})
+		}
+	}
+}
+
 // TestStreamBatch_InvalidBatch batch<=0 应返回错误，而不是 panic 或退化为一次性加载
 func TestStreamBatch_InvalidBatch(t *testing.T) {
 	name := uniq("test-batch-invalid")
@@ -395,17 +537,23 @@ func (d *flakyDialector) Initialize(gdb *gorm.DB) error {
 	return d.Dialector.Initialize(gdb)
 }
 
+// failingPlugin 在 Initialize 里记录建出的连接池。Initialize 由拨号 goroutine 调用，
+// 测试主 goroutine 会并发读取，因此用原子指针保存，避免数据竞争。
 type failingPlugin struct {
-	pool *sql.DB
+	pool atomic.Pointer[sql.DB]
 	err  error
 }
 
 func (*failingPlugin) Name() string { return "failing-plugin" }
 
 func (p *failingPlugin) Initialize(g *gorm.DB) error {
-	p.pool, _ = g.DB()
+	pool, _ := g.DB()
+	p.pool.Store(pool)
 	return p.err
 }
+
+// Pool 安全读取 Initialize 记录的连接池，未初始化前返回 nil。
+func (p *failingPlugin) Pool() *sql.DB { return p.pool.Load() }
 
 type pluginDialector struct {
 	gorm.Dialector
@@ -440,8 +588,8 @@ func TestOpen_PluginFailureClosesPool(t *testing.T) {
 				go in.GetDB(context.Background())
 				deadline := time.Now().Add(2 * time.Second)
 				for {
-					if plugin.pool != nil {
-						if err := plugin.pool.Ping(); err != nil && strings.Contains(err.Error(), "closed") {
+					if pool := plugin.Pool(); pool != nil {
+						if err := pool.Ping(); err != nil && strings.Contains(err.Error(), "closed") {
 							break
 						}
 					}
@@ -457,11 +605,12 @@ func TestOpen_PluginFailureClosesPool(t *testing.T) {
 			if g != nil {
 				t.Fatal("failed open must not return a GORM instance")
 			}
-			if plugin.pool == nil {
+			pool := plugin.Pool()
+			if pool == nil {
 				t.Fatal("plugin did not receive initialized pool")
 			}
-			t.Cleanup(func() { _ = plugin.pool.Close() })
-			if err := plugin.pool.Ping(); err == nil || !strings.Contains(err.Error(), "closed") {
+			t.Cleanup(func() { _ = pool.Close() })
+			if err := pool.Ping(); err == nil || !strings.Contains(err.Error(), "closed") {
 				t.Fatalf("failed initialization must close pool, got %v", err)
 			}
 		})
@@ -476,10 +625,11 @@ func TestQuery_NotFound(t *testing.T) {
 }
 
 // blockingDialector Initialize 先通知 started，等 release 后再真正建连，并记下建出的连接池。
+// pool 由拨号 goroutine 写入、测试主 goroutine 读取，用原子指针避免数据竞争。
 type blockingDialector struct {
 	gorm.Dialector
 	started, release chan struct{}
-	pool             *sql.DB
+	pool             atomic.Pointer[sql.DB]
 }
 
 func (d *blockingDialector) Initialize(gdb *gorm.DB) error {
@@ -488,9 +638,13 @@ func (d *blockingDialector) Initialize(gdb *gorm.DB) error {
 	if err := d.Dialector.Initialize(gdb); err != nil {
 		return err
 	}
-	d.pool, _ = gdb.DB()
+	pool, _ := gdb.DB()
+	d.pool.Store(pool)
 	return nil
 }
+
+// Pool 安全读取建出的连接池，未建出前返回 nil。
+func (d *blockingDialector) Pool() *sql.DB { return d.pool.Load() }
 
 func newBlocking() *blockingDialector {
 	return &blockingDialector{Dialector: sqlite.Open(":memory:"), started: make(chan struct{}), release: make(chan struct{})}
@@ -501,9 +655,10 @@ func TestClose_DuringConnect(t *testing.T) {
 	name := uniq("test-close-connect")
 	d := newBlocking()
 	in := db.Load(db.NewForTest(db.Options{Name: name, LogLevel: logger.Silent}, d))
+	// GetDB 走实例方法：等待者会一直阻塞，期间不再访问全局 dbm，避免与后续注册的写入竞争。
 	returned := make(chan struct{})
 	go func() {
-		db.GetDB(context.Background(), name)
+		in.GetDB(context.Background())
 		close(returned)
 	}()
 	<-d.started
@@ -517,11 +672,12 @@ func TestClose_DuringConnect(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for d.pool == nil || d.pool.Ping() == nil {
+	for pool := d.Pool(); pool == nil || pool.Ping() == nil; {
 		if time.Now().After(deadline) {
 			t.Fatal("pool created during Close must be closed")
 		}
 		time.Sleep(5 * time.Millisecond)
+		pool = d.Pool()
 	}
 }
 
@@ -534,9 +690,10 @@ func TestClose_BeforeConnect(t *testing.T) {
 	if err := in.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+	// GetDB 走实例方法：等待者会一直阻塞，期间不再访问全局 dbm，避免与后续注册的写入竞争。
 	returned := make(chan struct{})
 	go func() {
-		db.GetDB(context.Background(), name)
+		in.GetDB(context.Background())
 		close(returned)
 	}()
 	select {
