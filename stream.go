@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 )
@@ -25,9 +26,9 @@ func queryRows(ctx context.Context, name, query string, args []any) (*sql.Rows, 
 	return rows, nil
 }
 
-// scanRow 扫描当前行，将 []byte 转为独立的 string。
-func scanRow(rows *sql.Rows, n int) ([]any, error) {
-	values, ptrs := make([]any, n), make([]any, n)
+// scanRow 扫描当前行到独立的列切片，复用 ptrs 作为 Scan 目标切片，并将 []byte 转为独立的 string。
+func scanRow(rows *sql.Rows, ptrs []any) ([]any, error) {
+	values := make([]any, len(ptrs))
 	for i := range values {
 		ptrs[i] = &values[i]
 	}
@@ -43,8 +44,11 @@ func scanRow(rows *sql.Rows, n int) ([]any, error) {
 }
 
 // Stream 逐行查询，index 从 1 开始，回调错误立即返回。
-// 返回读取行数；列值为驱动原生类型，NULL 为 nil，[]byte 转为 string。
+// handle 不能为空；返回读取行数；列值为驱动原生类型，NULL 为 nil，[]byte 转为 string。
 func Stream(ctx context.Context, name string, query string, args []any, handle func(index int64, row []any) error) (int64, error) {
+	if handle == nil {
+		return 0, errors.New("stream handle must not be nil")
+	}
 	rows, err := queryRows(ctx, name, query, args)
 	if err != nil {
 		return 0, err
@@ -57,8 +61,9 @@ func Stream(ctx context.Context, name string, query string, args []any, handle f
 	}
 
 	var cnt int64
+	ptrs := make([]any, len(columns))
 	for rows.Next() {
-		row, err := scanRow(rows, len(columns))
+		row, err := scanRow(rows, ptrs)
 		if err != nil {
 			return cnt, fmt.Errorf("rows scan: %w", err)
 		}
@@ -70,11 +75,14 @@ func Stream(ctx context.Context, name string, query string, args []any, handle f
 	return cnt, rows.Err()
 }
 
-// StreamBatch 分批查询，batch 必须大于 0，最后不足一批也会回调。
+// StreamBatch 分批查询，batch 必须大于 0 且 fun 不能为空，最后不足一批也会回调。
 // 列名须唯一，列值规则同 Stream；返回读取行数和错误。
 func StreamBatch(ctx context.Context, name, query string, args []any, batch int, fun func(rows []map[string]any) error) (int64, error) {
 	if batch <= 0 {
 		return 0, fmt.Errorf("batch must be > 0, got %d", batch)
+	}
+	if fun == nil {
+		return 0, errors.New("stream batch callback must not be nil")
 	}
 	rows, err := queryRows(ctx, name, query, args)
 	if err != nil {
@@ -95,9 +103,10 @@ func StreamBatch(ctx context.Context, name, query string, args []any, batch int,
 	}
 
 	var cnt int64
+	ptrs := make([]any, len(columns))
 	batchs := make([]map[string]any, 0, batch)
 	for rows.Next() {
-		values, err := scanRow(rows, len(columns))
+		values, err := scanRow(rows, ptrs)
 		if err != nil {
 			return cnt, fmt.Errorf("rows scan: %w", err)
 		}

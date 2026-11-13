@@ -29,11 +29,11 @@ func Dialector(dsn string) gorm.Dialector {
 }
 
 // Open 立即打开 DuckDB 连接，不注册全局实例；调用方负责关闭。
-func Open(ctx context.Context, options db.Options) (*gorm.DB, error) {
-	return db.OpenDB(ctx, options.WithScheme("duckdb"))
+func Open(ctx context.Context, options db.Options, opts ...db.Option) (*gorm.DB, error) {
+	return db.OpenDB(ctx, options.WithScheme("duckdb"), opts...)
 }
 
 // New 登记 DuckDB 托管实例。首次 GetDB 时开始拨号，还没连上就等待。
-func New(options db.Options) error {
-	return db.CreateDB(options.WithScheme("duckdb"))
+func New(options db.Options, opts ...db.Option) error {
+	return db.CreateDB(options.WithScheme("duckdb"), opts...)
 }

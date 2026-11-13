@@ -80,6 +80,8 @@ func MaxOpenConns(n int) Option              { return func(o *Options) { o.MaxOp
 func ConnMaxLifeTime(d time.Duration) Option { return func(o *Options) { o.ConnMaxLifeTime = d } }
 func ConnMaxIdleTime(d time.Duration) Option { return func(o *Options) { o.ConnMaxIdleTime = d } }
 func DialTimeout(d time.Duration) Option     { return func(o *Options) { o.DialTimeout = d } }
+func ReadTimeout(d time.Duration) Option     { return func(o *Options) { o.ReadTimeout = d } }
+func WriteTimeout(d time.Duration) Option    { return func(o *Options) { o.WriteTimeout = d } }
 func LongQueryTime(d time.Duration) Option   { return func(o *Options) { o.LongQueryTime = d } }
 func LogLevel(level logger.LogLevel) Option  { return func(o *Options) { o.LogLevel = level } }
 

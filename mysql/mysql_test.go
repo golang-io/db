@@ -30,11 +30,12 @@ func TestMySQLNewDSN(t *testing.T) {
 		"user:pass@tcp([::1]:3306)/db%25prod?note=https%3A%2F%2Fexample",
 	} {
 		for _, prefix := range []string{"", "MYSQL://"} {
-			opts := db.Options{Name: t.TempDir(), URL: prefix + dsn}
-			if err := mysql.New(opts); err != nil {
+			opts := db.Options{URL: prefix + dsn}
+			name := t.TempDir()
+			if err := mysql.New(opts, db.Name(name)); err != nil {
 				t.Fatalf("mysql.New DSN: %v", err)
 			}
-			t.Cleanup(func() { _ = db.Get(opts.Name).Close() })
+			t.Cleanup(func() { _ = db.Get(name).Close() })
 		}
 	}
 }

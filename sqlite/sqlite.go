@@ -37,18 +37,26 @@ func Dialector(dsn string) gorm.Dialector {
 //     至少保留一个空闲连接，防止 MaxIdleConns <= 0 导致连接归还时销毁数据库。
 //   - 私有内存库（:memory:、未以 / 开头的 memdb 等）：每个连接各自一个库，所以只能单连接。
 func dialectorOf(dsn string, opts *db.Options) gorm.Dialector {
-	name, query, hasQuery := strings.Cut(dsn, "?")
+	fileURI := strings.HasPrefix(dsn, "file:")
+	base, fragment, hasFragment := dsn, "", false
+	if fileURI {
+		base, fragment, hasFragment = strings.Cut(dsn, "#")
+	}
+	name, query, _ := strings.Cut(base, "?")
 	params, _ := url.ParseQuery(query)
 	d := dialector{Dialector: sqlite.Dialector{DSN: dsn}}
 	if dsn != "" && !params.Has("_txlock") {
-		if hasQuery {
-			d.DSN += "&_txlock=immediate"
+		// 正确衔接空查询串（如 "app.db?"）与 file URI 的 #fragment，避免拼出 "?&" 或将参数追入片段。
+		if query == "" {
+			d.DSN = name + "?_txlock=immediate"
 		} else {
-			d.DSN += "?_txlock=immediate"
+			d.DSN = name + "?" + query + "&_txlock=immediate"
+		}
+		if hasFragment {
+			d.DSN += "#" + fragment
 		}
 	}
 
-	fileURI := strings.HasPrefix(dsn, "file:")
 	if fileURI {
 		if u, err := url.Parse(dsn); err == nil {
 			name = u.Path
@@ -88,13 +96,13 @@ func (dialector) RollbackTo(tx *gorm.DB, name string) error {
 }
 
 // Open 立即打开 SQLite 连接，不注册全局实例；调用方负责关闭。
-func Open(ctx context.Context, options db.Options) (*gorm.DB, error) {
-	return db.OpenDB(ctx, withScheme(options))
+func Open(ctx context.Context, options db.Options, opts ...db.Option) (*gorm.DB, error) {
+	return db.OpenDB(ctx, withScheme(options), opts...)
 }
 
 // New 登记 SQLite 托管实例。首次 GetDB 时开始拨号，还没连上就等待。
-func New(options db.Options) error {
-	return db.CreateDB(withScheme(options))
+func New(options db.Options, opts ...db.Option) error {
+	return db.CreateDB(withScheme(options), opts...)
 }
 
 // withScheme 补齐 sqlite://，保留原始 DSN。

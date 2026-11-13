@@ -1,3 +1,4 @@
+// mysql_test.go 覆盖不连接真实服务器的 MySQL 相关检查：URL 与密码打码、超时回填、管理账号授权文本。
 package db_test
 
 import (
@@ -168,6 +169,21 @@ func TestOpenDBOptionsTimeouts(t *testing.T) {
 			}
 		})
 	}
+
+	// 验证 db.DialTimeout / db.ReadTimeout / db.WriteTimeout Option 覆盖项生效。
+	dialector, err := db.PrepareDialectorForTest(
+		db.Options{URL: dsn},
+		db.DialTimeout(4*time.Second),
+		db.ReadTimeout(12*time.Second),
+		db.WriteTimeout(15*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := dialector.(*gormmysql.Dialector).DSNConfig
+	if cfg.Timeout != 4*time.Second || cfg.ReadTimeout != 12*time.Second || cfg.WriteTimeout != 15*time.Second {
+		t.Fatalf("Option timeouts = %v/%v/%v, want 4s/12s/15s", cfg.Timeout, cfg.ReadTimeout, cfg.WriteTimeout)
+	}
 }
 
 func TestOpenDBHandshakeTimeout(t *testing.T) {
@@ -211,6 +227,41 @@ func TestOpenDBHandshakeTimeout(t *testing.T) {
 			elapsed := time.Since(start)
 			if err == nil || elapsed < 50*time.Millisecond || elapsed >= time.Second {
 				t.Fatalf("expected handshake timeout within 1s, elapsed=%v, err=%v", elapsed, err)
+			}
+		})
+	}
+}
+
+// TestMySQLAdminGrantCheck 不连接数据库，只核对授权文本的判定。
+func TestMySQLAdminGrantCheck(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		grants  []string
+		missing int
+	}{
+		{"global all", []string{"GRANT ALL PRIVILEGES ON *.* TO `root`@`%` WITH GRANT OPTION"}, 0},
+		{"all without grant option", []string{"GRANT ALL PRIVILEGES ON *.* TO `root`@`%`"}, 1},
+		{"create user is not create", []string{"GRANT CREATE USER ON *.* TO `u`@`%` WITH GRANT OPTION"}, 4},
+		{"explicit minimal privileges", []string{
+			"GRANT SELECT, INSERT, CREATE, DROP, CREATE USER ON *.* TO `u`@`%` WITH GRANT OPTION",
+		}, 0},
+		{"missing delegated select and insert", []string{
+			"GRANT CREATE, DROP, CREATE USER ON *.* TO `u`@`%` WITH GRANT OPTION",
+		}, 2},
+		{"dynamic grant option does not cover static privileges", []string{
+			"GRANT SELECT, INSERT, CREATE, DROP, CREATE USER ON *.* TO `u`@`%`",
+			"GRANT CONNECTION_ADMIN ON *.* TO `u`@`%` WITH GRANT OPTION",
+		}, 1},
+		{"dynamic grant option only", []string{
+			"GRANT USAGE ON *.* TO `u`@`%`",
+			"GRANT CONNECTION_ADMIN ON *.* TO `u`@`%` WITH GRANT OPTION",
+		}, 6},
+		{"database all is not global", []string{"GRANT ALL PRIVILEGES ON `app`.* TO `u`@`%` WITH GRANT OPTION"}, 6},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := missingAdminPrivileges(tt.grants)
+			if len(got) != tt.missing {
+				t.Fatalf("missing = %v, want %d items", got, tt.missing)
 			}
 		})
 	}

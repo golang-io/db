@@ -1,6 +1,6 @@
 # db
 
-基于 [GORM](https://gorm.io) 的数据库连接封装：支持 **MySQL**、**SQLite**、**DuckDB**、**ClickHouse**，提供统一 URL 入口、按名称注册的多实例、懒连接与可插拔日志。
+基于 [GORM](https://gorm.io) 的数据库连接封装：支持 **MySQL**、**PostgreSQL**、**SQLite**、**DuckDB**、**ClickHouse**，提供统一 URL 入口、按名称注册的多实例、懒连接与可插拔日志。
 
 **English:** Small GORM wrapper with multi-driver URLs, named instances, lazy connect, and dual-channel logging.
 
@@ -8,7 +8,7 @@
 
 | 能力 | 说明 |
 |------|------|
-| 多驱动 | `mysql` / `sqlite` / `duckdb` / `clickhouse`，通过 `CreateDB` 按 URL scheme 自动分发 |
+| 多驱动 | `mysql` / `postgres` / `sqlite` / `duckdb` / `clickhouse`，通过 `CreateDB` 按 URL scheme 自动分发 |
 | 全局多实例 | `Name` 注册，`GetDB(ctx, name)` 获取带 `context` 的 `*gorm.DB` |
 | 懒连接 | 首次 `GetDB` 时开始拨号；还没连上就等待，失败每 **10s** 重试。返回的 `*gorm.DB` 已经可用 |
 | 连接池 | `MaxIdleConns` / `MaxOpenConns` / `ConnMaxLifeTime` / `ConnMaxIdleTime`（含合理默认值） |
@@ -25,16 +25,17 @@
 go get github.com/golang-io/db
 ```
 
-本库提供 `github.com/golang-io/db/sqlite` / `github.com/golang-io/db/mysql` / `github.com/golang-io/db/duckdb` 子包，按需导入即可自动注册对应驱动（仅需注册时使用空白导入）。子包均提供 `Dialector`、`Open` 和 `New`：`Open` 立即建连，`New` 按名登记托管实例，两者均支持不带 scheme 的 DSN。ClickHouse 和其他方言仍需手动调用 `db.Register`，见[手动注册驱动](#手动注册驱动)。不要重复注册已导入子包的 scheme。
+本库提供 `github.com/golang-io/db/sqlite` / `github.com/golang-io/db/mysql` / `github.com/golang-io/db/postgres` / `github.com/golang-io/db/duckdb` 子包，按需导入即可自动注册对应驱动（仅需注册时使用空白导入）。子包均提供 `Dialector`、`Open` 和 `New`：`Open` 立即建连，`New` 按名登记托管实例，两者均支持不带 scheme 的 DSN。ClickHouse 和其他方言仍需手动调用 `db.Register`，见[手动注册驱动](#手动注册驱动)。不要重复注册已导入子包的 scheme。
 
 | scheme | 第三方 GORM 方言 | 安装命令 |
 |--------|-----------------|----------|
-| `sqlite` | `github.com/libtnb/sqlite`（纯 Go，无需 CGO，底层 `modernc.org/sqlite`） | `go get github.com/libtnb/sqlite@v1.2.2` |
+| `sqlite` | `github.com/libtnb/sqlite`（纯 Go，无需 CGO，底层 `modernc.org/sqlite`） | `go get github.com/libtnb/sqlite@v1.3.0` |
 | `mysql` | `gorm.io/driver/mysql` | `go get gorm.io/driver/mysql@v1.6.0 github.com/go-sql-driver/mysql@v1.10.1` |
+| `postgres` / `postgresql` | `gorm.io/driver/postgres`（底层 `github.com/jackc/pgx/v5`） | `go get gorm.io/driver/postgres@v1.6.3` |
 | `duckdb` | 本库 `duckdb` 子包自带方言，底层 `github.com/duckdb/duckdb-go/v2`（需要 CGO） | `go get github.com/duckdb/duckdb-go/v2@v2.20000.0` |
 | `clickhouse` | `gorm.io/driver/clickhouse` | `go get gorm.io/driver/clickhouse`（本仓库未引入，版本组合需自行验证：`clickhouse-go/v2` 与 `ch-go` 须配套） |
 
-子包和根包测试依赖 mysql / sqlite / duckdb 驱动，因此 `go.mod` 列出这些依赖；业务二进制只包含实际导入的驱动。
+子包和根包测试依赖 mysql / postgres / sqlite / duckdb 驱动，因此 `go.mod` 列出这些依赖；业务二进制只包含实际导入的驱动。
 
 DuckDB 子包自带迁移器，首次建表时会为自增列自动创建序列，支持非主键自增列的重复迁移。已有表新增自增列需要显式迁移，`AddColumn` / `AutoMigrate` 返回 `duckdb.ErrNotSupport`；普通列仍可自动添加。不支持改列类型、删除约束和重命名索引，这几项也返回 `duckdb.ErrNotSupport`。DuckDB 不支持 `SAVEPOINT`，嵌套 `Transaction` 会返回 `gorm.ErrUnsupportedDriver`。
 
@@ -77,17 +78,19 @@ func main() {
 | Scheme | 示例 URL（节选） |
 |--------|------------------|
 | `mysql` | `mysql://user:pass@tcp(host:3306)/db?charset=utf8mb4&parseTime=True&loc=Local` |
+| `postgres` / `postgresql` | `postgres://user:pass@localhost:5432/mydb?sslmode=disable` |
 | `sqlite` | `sqlite:///path/to/file.db`；内存库需配置连接池参数，见 [SQLite 使用说明](#sqlite-使用说明) |
 | `clickhouse` | `clickhouse://user:pass@localhost:9000/db` |
 | `duckdb` | `duckdb:///path/to/file.duckdb`；`duckdb://` 或 `duckdb://:memory:` 为内存库，连接池内所有连接共享同一个库 |
 
 不支持的 scheme 会返回 `unknown database schema: ...`。
 
-URL 处理只识别开头的外层 `scheme://`（scheme 以字母开头，其后允许字母、数字、`+`、`-`、`.`），只剥离一层；DSN 原样交给驱动，不做通用 URL 解码、路径清理或查询参数改写（唯一例外：`sqlite` 子包在 DSN 未指定 `_txlock` 时追加 `_txlock=immediate`，见 SQLite 使用说明）。转义规则仍由驱动定义，例如 MySQL 参数中的 `https://example` 应写成 `https%3A%2F%2Fexample`，本库不会自动修正非法 DSN。
+URL 处理只识别开头的外层 `scheme://`（scheme 以字母开头，其后允许字母、数字、`+`、`-`、`.`），只剥离一层；DSN 原样交给驱动，不做通用 URL 解码、路径清理或查询参数改写（唯一例外：`sqlite` 子包在 DSN 未指定 `_txlock` 时追加 `_txlock=immediate`，见 SQLite 使用说明）。转义规则仍由驱动定义，例如 MySQL 参数中的 `https://example` 应写成 `https%3A%2F%2Fexample`，本库不会自动修正非法 DSN。PostgreSQL URL 的用户信息含 `@`、`:`、`/` 等特殊字符时须百分号编码，否则 `pgx` 会拆错用户、密码或主机。
 
 - 根包 `CreateDB` / `OpenDB` 必须带数据库前缀。SQLite 原生 URI 应写为 `sqlite://file:///tmp/app.db`，而不是单独的 `file:///tmp/app.db`。
 - `sqlite` 子包的 `Open` / `New` 会为裸 `file:` URI 补上 `sqlite://`；已带数据库前缀时不重复添加。
 - `mysql` 子包的 `Open` / `New` 支持裸 DSN，密码或参数内部的 `https://` 不会被当作外层 scheme。原生 DSN 若恰好以合法 `scheme://` 开头则存在歧义，请显式添加数据库前缀。
+- `postgres` 子包的 `Open` / `New` 支持裸 URL DSN（如 `user:pass@localhost:5432/mydb`），会自动补齐 `postgres://`；只支持 URL 格式，见 [PostgreSQL 使用说明](#postgresql-使用说明)。
 - 已带其他合法 scheme 时保持原样，不猜测或改换驱动。
 
 例如，导入 `github.com/golang-io/db/sqlite` 后，`sqlite.Open(ctx, db.Options{URL: "file:///tmp/app.db?mode=rwc"})` 与 `db.OpenDB(ctx, db.Options{URL: "sqlite://file:///tmp/app.db?mode=rwc"})` 使用同一 DSN。
@@ -97,6 +100,24 @@ MySQL 超时由 `mysql` 子包的注册工厂应用，不是根包自动设置�
 保留 GORM 默认自动 Ping，不额外执行手动探活。MySQL 初始化和探活依赖 DSN 超时；这些超时不是整个初始化的总时限。`GetDB` 会一直等到连上，请求 `ctx` 不结束这次等待，也不取消正在进行的拨号。
 
 **生产环境建议在 MySQL DSN 中配置 `readTimeout`**（如 `readTimeout=30s`）。`timeout`（即 `DialTimeout`）只限制 TCP 建连；若对端接受连接却不回握手包（如负载均衡后的数据库无响应），GORM 方言初始化查询 `SELECT VERSION()` 和自动 Ping 都不受请求 `ctx` 约束，在未设 `readTimeout` 时这一次拨号会一直停住，下一轮重试要等它结束。`readTimeout` 也作用于每条查询，取值需大于最长查询耗时。
+
+### PostgreSQL 使用说明
+
+导入 `github.com/golang-io/db/postgres` 即注册 `postgres` 与 `postgresql` 两个 scheme，二者共用同一工厂；`Dialector`、`Open`、`New` 与其它子包一致，`Open` / `New` 支持不带 scheme 的 DSN。
+
+```go
+import (
+	"github.com/golang-io/db"
+	_ "github.com/golang-io/db/postgres"
+)
+
+_ = db.CreateDB(db.Options{Name: "pg", URL: "postgres://user:pass@localhost:5432/mydb?sslmode=disable"})
+```
+
+- **只支持 URL 格式 DSN**：根包去掉外层 `scheme://` 后，`pgx` 仅把以 `postgres://` / `postgresql://` 开头的串当 URL 解析，因此工厂统一补回 `postgres://`（`pgx` 也认 `postgresql://`），别名无需额外配置。`postgres://host=localhost user=x dbname=y` 这类 key=value 格式会被补坏，确需使用请不导入子包、自行调用 `db.Register`。
+- **凭据转义**：用户、密码中的 `@`、`:`、`/` 等须百分号编码，否则 `pgx` 会拆错用户、密码或主机。
+- **超时**：`Options.DialTimeout` / `ReadTimeout` / `WriteTimeout` 不回填到 PostgreSQL DSN。需要建连超时时在 DSN 中显式写 `connect_timeout=<秒>`（整数，`0` 为不限）；它只限制单主机连接与握手阶段，不覆盖前置域名解析和 GORM 自动 Ping，请求 `ctx` 也不结束 `GetDB` 的建连等待。
+- **错误时机**：工厂通过 `pgx.ParseConfig` 预校验连接串，语法或参数非法的 DSN 在 `CreateDB` / `OpenDB` / `New` / `Open` 阶段立即返回错误，不会进入后台 10s 重试。
 
 ### 一次性打开连接（不注册全局 `dbm`）
 
@@ -115,7 +136,7 @@ gormDB, err := db.Open(ctx, gormmysql.Open(dsn), db.Options{MaxOpenConns: 20}) /
 
 ### 手动注册驱动
 
-`CreateDB` / `OpenDB` 按 URL scheme 查找已注册的方言（`Open` 直接使用传入的方言，无需注册）：导入 `sqlite` / `mysql` / `duckdb` 子包会自动注册，其他方言需手动注册。下面是不导入子包时的完整注册代码，放到业务项目的 Go 文件中，按需保留所用驱动及对应导入。每个 scheme 只能注册一次：已导入子包的 scheme 不要再手动注册，否则会 panic。
+`CreateDB` / `OpenDB` 按 URL scheme 查找已注册的方言（`Open` 直接使用传入的方言，无需注册）：导入 `sqlite` / `mysql` / `postgres` / `duckdb` 子包会自动注册，其他方言需手动注册。下面是不导入子包时的完整注册代码，放到业务项目的 Go 文件中，按需保留所用驱动及对应导入。每个 scheme 只能注册一次：已导入子包的 scheme 不要再手动注册，否则会 panic。
 
 ```go
 package main
@@ -164,35 +185,13 @@ func init() {
 
 ### 其他 GORM 方言
 
-例如 PostgreSQL 使用 URL 格式 DSN 时可这样注册：
-
-```go
-import (
-	"github.com/golang-io/db"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
-)
-
-func init() {
-	db.Register("postgres", func(dsn string, _ *db.Options) (gorm.Dialector, error) {
-		// CreateDB / OpenDB 会去掉 "postgres://" 只传后半段，URL 格式的 DSN 需要补回 scheme
-		return postgres.Open("postgres://" + dsn), nil
-	})
-}
-
-// 注册后与内置驱动用法一致
-_ = db.CreateDB(db.Options{Name: "pg", URL: "postgres://user:pass@localhost:5432/mydb"})
-```
-
-注意事项：
+PostgreSQL 已由 `postgres` 子包内置，见 [PostgreSQL 使用说明](#postgresql-使用说明)，不要再手动注册 `postgres` / `postgresql`。ClickHouse 等未内置方言仍按上文示例手动注册，注意事项：
 
 - **只能在 `init()` 中注册**：驱动注册表不加锁，之后只读。
 - **scheme 建议与 `Dialector.Name()` 一致**：例如 gorm 的 postgres 方言 `Name()` 返回 `"postgres"`，就注册为 `"postgres"`，便于在配置和日志中对应。
-- **传给注册工厂的 DSN 已去掉 `scheme://`**：驱动若要求 DSN 带 scheme（如 URL 格式的 PostgreSQL、ClickHouse），需在工厂中补回；使用 key=value 格式 DSN（如 `postgres://host=localhost user=x dbname=y`）则无需补回，但此时不要再补 scheme。
-- **别名需单独注册**：配置中使用 `postgresql://` 时，需再注册一次 `"postgresql"`。
+- **传给注册工厂的 DSN 已去掉 `scheme://`**：驱动若要求 DSN 带 scheme（如 URL 格式的 PostgreSQL、ClickHouse），需在工厂中补回；key=value 格式 DSN（如 `postgres://host=localhost user=x dbname=y`）则无需补回，此时不要再补 scheme。
+- **别名需单独注册**：配置中使用 `postgresql://` 时，需再注册一次 `"postgresql"`（`postgres` 子包已代为注册）。
 - 默认跳过 GORM 默认事务；仅当 `dialector.Name()` 为 `"clickhouse"` 时保留默认事务，以支持批量写入。
-
-> 以上 PostgreSQL 示例未在本仓库实测（未引入 postgres 驱动依赖），接入时请验证 DSN 解析。
 
 ### 预编译缓存的使用边界
 
@@ -294,7 +293,7 @@ _ = sqlite.New(db.Options{Name: "cache", URL: "file:/cache?vfs=memdb"})
 | `MaxIdleConns` / `MaxOpenConns` | 连接池 | 10 / 50 |
 | `ConnMaxLifeTime` | 连接最大存活时间（负数表示不回收） | 1h |
 | `ConnMaxIdleTime` | 连接最大空闲时间（回收被 MySQL/LB 静默关闭的空闲连接；负数表示不回收） | 10m |
-| `DialTimeout` / `ReadTimeout` / `WriteTimeout` | 交给注册工厂应用的建连 / 读 / 写超时；MySQL 示例仅回填 DSN 的零值，负数取零 | 3s / 不设置 / 不设置 |
+| `DialTimeout` / `ReadTimeout` / `WriteTimeout` | 交给注册工厂应用的建连 / 读 / 写超时；MySQL 工厂仅回填 DSN 的零值（负数取零），`postgres` 工厂不回填，改用 DSN 的 `connect_timeout` | 3s / 不设置 / 不设置 |
 | `LongQueryTime` | 慢查询阈值（日志 `SLOW:`） | 5s |
 | `Output` | SQL 日志 `io.Writer` | `os.Stdout` |
 | `Log` | 业务日志（连接、重试） | 空实现 |

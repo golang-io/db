@@ -120,22 +120,22 @@ func (m Migrator) CreateTable(values ...interface{}) error {
 	return nil
 }
 
-// HasTable 检查表是否存在（duckdb_tables，避免 information_schema + schema 绑定歧义）。
+// HasTable 检查当前数据库与当前 schema 下表是否存在（duckdb_tables，避免 information_schema + ATTACH 多库同名歧义）。
 func (m Migrator) HasTable(value interface{}) bool {
 	var count int64
 	_ = m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		return m.DB.Raw(
-			`SELECT count(*) FROM duckdb_tables() WHERE schema_name = current_schema() AND table_name = ?`,
+			`SELECT count(*) FROM duckdb_tables() WHERE database_name = current_database() AND schema_name = current_schema() AND table_name = ?`,
 			stmt.Table,
 		).Scan(&count).Error
 	})
 	return count > 0
 }
 
-// GetTables 列出当前 schema 下用户表。
+// GetTables 列出当前数据库、当前 schema 下用户表。
 func (m Migrator) GetTables() (tableList []string, err error) {
 	err = m.DB.Raw(
-		`SELECT table_name FROM duckdb_tables() WHERE schema_name = current_schema() ORDER BY table_name`,
+		`SELECT table_name FROM duckdb_tables() WHERE database_name = current_database() AND schema_name = current_schema() ORDER BY table_name`,
 	).Scan(&tableList).Error
 	return
 }
@@ -165,7 +165,7 @@ func (m Migrator) HasColumn(value interface{}, field string) bool {
 			}
 		}
 		return m.DB.Raw(
-			`SELECT count(*) FROM duckdb_columns() WHERE schema_name = current_schema() AND table_name = ? AND column_name = ?`,
+			`SELECT count(*) FROM duckdb_columns() WHERE database_name = current_database() AND schema_name = current_schema() AND table_name = ? AND column_name = ?`,
 			stmt.Table, name,
 		).Scan(&count).Error
 	})
@@ -286,7 +286,7 @@ func (m Migrator) HasIndex(value interface{}, name string) bool {
 			}
 		}
 		return m.DB.Raw(
-			`SELECT count(*) FROM duckdb_indexes() WHERE schema_name = current_schema() AND table_name = ? AND index_name = ?`,
+			`SELECT count(*) FROM duckdb_indexes() WHERE database_name = current_database() AND schema_name = current_schema() AND table_name = ? AND index_name = ?`,
 			stmt.Table, name,
 		).Scan(&count).Error
 	})
@@ -352,7 +352,7 @@ func (m Migrator) HasConstraint(value interface{}, name string) bool {
 		}
 		return m.DB.Raw(
 			`SELECT count(*) FROM information_schema.table_constraints
-			 WHERE table_schema = current_schema() AND table_name = ? AND constraint_name = ?`,
+			 WHERE table_catalog = current_database() AND table_schema = current_schema() AND table_name = ? AND constraint_name = ?`,
 			table, name,
 		).Scan(&count).Error
 	})

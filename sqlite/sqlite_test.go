@@ -389,3 +389,44 @@ func TestSQLiteConcurrentTx(t *testing.T) {
 		})
 	}
 }
+
+// TestSQLiteDSNTxLockFormatting 验证空查询串与 #fragment 下追加 _txlock=immediate 的格式，以及子包 Open/New 接收 db.Option。
+func TestSQLiteDSNTxLockFormatting(t *testing.T) {
+	dir := t.TempDir()
+	baseFile := filepath.Join(dir, "empty_query.db")
+	for _, tt := range []struct {
+		name string
+		dsn  string
+		want string
+	}{
+		{"empty trailing question mark", baseFile + "?", baseFile + "?_txlock=immediate"},
+		{"plain filename with hash", filepath.Join(dir, "a#b.db"), filepath.Join(dir, "a#b.db") + "?_txlock=immediate"},
+		{"file uri with fragment", "file:" + filepath.ToSlash(baseFile) + "#frag", "file:" + filepath.ToSlash(baseFile) + "?_txlock=immediate#frag"},
+		{"file uri with query and fragment", "file:" + filepath.ToSlash(baseFile) + "?mode=rwc#frag", "file:" + filepath.ToSlash(baseFile) + "?mode=rwc&_txlock=immediate#frag"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := sqlite.Dialector(tt.dsn)
+			got := reflect.ValueOf(d).FieldByName("DSN").String()
+			if got != tt.want {
+				t.Fatalf("DSN = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	g, err := sqlite.Open(context.Background(), db.Options{URL: baseFile + "?"}, db.MaxIdleConns(0), db.LogLevel(logger.Silent))
+	if err != nil {
+		t.Fatalf("sqlite.Open with Option: %v", err)
+	}
+	pool, err := g.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+	var n int
+	if err := g.Raw("SELECT 1").Scan(&n).Error; err != nil || n != 1 {
+		t.Fatalf("SELECT 1 = %d, err=%v", n, err)
+	}
+	if got := pool.Stats().Idle; got != 0 {
+		t.Fatalf("idle conns = %d, want 0 from db.MaxIdleConns(0)", got)
+	}
+}

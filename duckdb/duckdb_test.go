@@ -46,7 +46,7 @@ func open(t *testing.T, url string) *gorm.DB {
 	return g
 }
 
-// products 建表：本子包不支持迁移，测试用 CREATE TABLE 建表，自增列自己建序列。
+// products 手动创建带序列的测试表，用于不经过 AutoMigrate 的基础 CRUD 与事务用例。
 func products(g *gorm.DB) *gorm.DB {
 	if err := g.Exec(`
 		CREATE SEQUENCE products_id_seq START 1;
@@ -371,7 +371,7 @@ func TestNewConcurrent(t *testing.T) {
 
 func TestFilePersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "t.duckdb")
-	g1, err := duckdb.Open(context.Background(), db.Options{URL: path, LogLevel: logger.Silent})
+	g1, err := duckdb.Open(context.Background(), db.Options{URL: path}, db.LogLevel(logger.Silent), db.MaxIdleConns(0))
 	if err != nil {
 		t.Fatal(err)
 	}

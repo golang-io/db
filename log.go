@@ -13,7 +13,7 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// Logger 接收连接与重试日志。
+// Logger 接收连接与重试等业务日志；args 为交替排列的键值对（与 log/slog 约定一致，如 "name", "default", "err", err）。
 type Logger interface {
 	Info(ctx context.Context, msg string, args ...any)
 	Warn(ctx context.Context, msg string, args ...any)

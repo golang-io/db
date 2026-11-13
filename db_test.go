@@ -1,4 +1,4 @@
-// db_test.go 包含 db 包的单元测试，主要验证 DBLogger、驱动注册与建连重试等核心能力。
+// db_test.go 验证日志、驱动注册、建连重试，以及可控驱动下的宕机与恢复。
 
 package db_test
 
@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"reflect"
@@ -27,26 +29,6 @@ import (
 var seq atomic.Int64
 
 func uniq(name string) string { return fmt.Sprintf("%s-%d", name, seq.Add(1)) }
-
-// testLogger 是 Logger 接口的测试实现，将业务日志输出到 testing.T。
-type testLogger struct {
-	t *testing.T
-}
-
-func (l *testLogger) Info(_ context.Context, msg string, args ...any) {
-	l.t.Helper()
-	l.t.Logf("[DB INFO] "+msg, args...)
-}
-
-func (l *testLogger) Warn(_ context.Context, msg string, args ...any) {
-	l.t.Helper()
-	l.t.Logf("[DB WARN] "+msg, args...)
-}
-
-func (l *testLogger) Error(_ context.Context, msg string, args ...any) {
-	l.t.Helper()
-	l.t.Logf("[DB ERROR] "+msg, args...)
-}
 
 // Test_DBLogger 验证 DBLogger 各日志方法（Info、Warn、Error）和 Trace 的输出行为。
 func Test_DBLogger(t *testing.T) {
@@ -319,7 +301,7 @@ func TestQuery_DuplicateColumns(t *testing.T) {
 	}
 }
 
-// TestDriverSchemeMatchesDialectorName Open(ctx, dialector, opts) 按 dialector.Name() 检查注册，scheme 必须与之一致
+// TestDriverSchemeMatchesDialectorName 内置子包注册的默认 scheme 与 Dialector.Name() 保持一致。
 func TestDriverSchemeMatchesDialectorName(t *testing.T) {
 	for _, scheme := range []string{"mysql", "sqlite"} {
 		d, err := db.GetDriver(scheme)
@@ -336,7 +318,7 @@ func TestDriverSchemeMatchesDialectorName(t *testing.T) {
 	}
 }
 
-// customDialector 模拟本库没有子包的方言（如 postgres）
+// customDialector 模拟本库未内置子包的自定义方言（如 clickhouse）。
 type customDialector struct {
 	gorm.Dialector
 	name string
@@ -488,16 +470,23 @@ func TestOpen_NameDefaults(t *testing.T) {
 	}
 }
 
-// TestStreamBatch_InvalidBatch batch<=0 应返回错误，而不是 panic 或退化为一次性加载
+// TestStreamBatch_InvalidBatch batch<=0 或回调为 nil 应立即返回错误，而不是 panic 或退化为一次性加载。
 func TestStreamBatch_InvalidBatch(t *testing.T) {
 	name := uniq("test-batch-invalid")
 	if err := db.CreateDB(db.Options{Name: name, URL: "sqlite://:memory:", LogLevel: logger.Silent}); err != nil {
 		t.Fatalf("CreateDB: %v", err)
 	}
+	t.Cleanup(func() { _ = db.Get(name).Close() })
 	for _, b := range []int{0, -1} {
 		if _, err := db.StreamBatch(context.Background(), name, "SELECT 1", nil, b, func([]map[string]any) error { return nil }); err == nil {
 			t.Fatalf("batch=%d: expect error", b)
 		}
+	}
+	if _, err := db.Stream(context.Background(), name, "SELECT 1 WHERE 0", nil, nil); err == nil {
+		t.Fatal("Stream with nil handle must return error even on empty result set")
+	}
+	if _, err := db.StreamBatch(context.Background(), name, "SELECT 1 WHERE 0", nil, 10, nil); err == nil {
+		t.Fatal("StreamBatch with nil callback must return error even on empty result set")
 	}
 }
 
@@ -507,13 +496,15 @@ func TestGetDB_Unreachable(t *testing.T) {
 	if err := db.CreateDB(db.Options{Name: name, URL: "mysql://root:root@tcp(127.0.0.1:1)/db?charset=utf8mb4"}); err != nil {
 		t.Fatalf("CreateDB: %v", err)
 	}
-	defer db.Get(name).Close()
+	in := db.Get(name)
+	defer in.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
+	// 主协程先拿到实例引用，避免未退出的等待协程在后续用例注册新实例时并发读取 dbm。
 	returned := make(chan struct{})
 	go func() {
-		db.GetDB(ctx, name)
+		in.GetDB(ctx)
 		close(returned)
 	}()
 	select {
@@ -765,5 +756,180 @@ func TestGetDB_RetryUntilConnected(t *testing.T) {
 	var n int
 	if err := g.Raw("SELECT 1").Scan(&n).Error; err != nil || n != 1 {
 		t.Fatalf("SELECT 1 = %d, err=%v", n, err)
+	}
+}
+
+// 以下用可控驱动观察「连上 → 中断 → 恢复」。
+// 真实 MySQL 只能看到池指针；这里能数清本库有没有重新 Initialize，以及坏连接错误类型是否会换物理连接。
+
+var (
+	errDown   = errors.New("database is down (test)")
+	errBroken = errors.New("connection reset (test)")
+)
+
+// outageServer 模拟数据库宕机与重启：down 时拒绝新连接，重启后 epoch 变化使旧连接失效。
+type outageServer struct {
+	down  atomic.Bool
+	epoch atomic.Int64
+	dials atomic.Int64 // 物理连接建立次数
+	inits atomic.Int64 // Dialector.Initialize 次数，即本库拨号次数
+	plain bool         // 旧连接失效时报普通错误，而不是 driver.ErrBadConn
+}
+
+func (s *outageServer) Connect(context.Context) (driver.Conn, error) {
+	if s.down.Load() {
+		return nil, errDown
+	}
+	s.dials.Add(1)
+	return &outageConn{s: s, epoch: s.epoch.Load()}, nil
+}
+
+func (s *outageServer) Driver() driver.Driver { return outageDriver{s} }
+
+type outageDriver struct{ s *outageServer }
+
+func (d outageDriver) Open(string) (driver.Conn, error) { return d.s.Connect(context.Background()) }
+
+type outageConn struct {
+	s      *outageServer
+	epoch  int64
+	broken atomic.Bool
+}
+
+func (c *outageConn) check() error {
+	if c.broken.Load() {
+		return errBroken
+	}
+	if c.s.down.Load() || c.epoch != c.s.epoch.Load() {
+		if c.s.plain {
+			c.broken.Store(true) // 普通错误不会让 database/sql 丢弃这条坏连接
+			return errBroken
+		}
+		return driver.ErrBadConn
+	}
+	return nil
+}
+
+func (c *outageConn) QueryContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+	if err := c.check(); err != nil {
+		return nil, err
+	}
+	return &oneRow{}, nil
+}
+
+func (c *outageConn) Ping(context.Context) error          { return c.check() }
+func (c *outageConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unsupported") }
+func (c *outageConn) Begin() (driver.Tx, error)           { return nil, errors.New("unsupported") }
+func (c *outageConn) Close() error                        { return nil }
+
+type oneRow struct{ done bool }
+
+func (r *oneRow) Columns() []string { return []string{"n"} }
+func (r *oneRow) Close() error      { return nil }
+func (r *oneRow) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = int64(1)
+	return nil
+}
+
+// outageDialector 把可控连接池注入 GORM，其余方法复用 sqlite 方言。
+type outageDialector struct {
+	gorm.Dialector
+	s *outageServer
+}
+
+func (d *outageDialector) Initialize(g *gorm.DB) error {
+	d.s.inits.Add(1)
+	g.ConnPool = sql.OpenDB(d.s)
+	return nil
+}
+
+// TestGetDB_OutageAndRecover 连上之后数据库异常：GetDB 不阻塞、不重拨。
+// driver.ErrBadConn 会换物理连接并恢复；普通错误会把坏连接留在池里。
+func TestGetDB_OutageAndRecover(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		plain bool
+	}{
+		{"driver reports bad conn", false},
+		{"driver reports plain error", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &outageServer{plain: tt.plain}
+			name := uniq("outage")
+			opts := db.Options{Name: name, LogLevel: logger.Silent, Output: io.Discard, MaxOpenConns: 1, MaxIdleConns: 1}
+			in := db.Load(db.NewForTest(opts, &outageDialector{Dialector: sqlite.Open(":memory:"), s: s}))
+			t.Cleanup(func() { _ = in.Close() })
+			ctx := context.Background()
+
+			rows, err := db.Query(ctx, name, "SELECT 1")
+			if err != nil || len(rows) != 1 || rows[0]["n"] != int64(1) {
+				t.Fatalf("before outage: rows=%v, err=%v", rows, err)
+			}
+			pool, err := db.GetDB(ctx, name).DB()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := s.inits.Load(); n != 1 {
+				t.Fatalf("inits=%d, want 1", n)
+			}
+
+			s.down.Store(true)
+			dials := s.dials.Load()
+			_, err = db.Query(ctx, name, "SELECT 1")
+			if err == nil {
+				t.Fatal("query must fail during outage")
+			}
+			t.Logf("during outage: err=%v, inits=%d, dials=%d", err, s.inits.Load(), s.dials.Load())
+			done := make(chan struct{})
+			go func() { db.GetDB(ctx, name); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("GetDB blocked during outage")
+			}
+			pool2, err := db.GetDB(ctx, name).DB()
+			if err != nil || pool2 != pool {
+				t.Fatalf("pool replaced: %v", err)
+			}
+			if n := s.inits.Load(); n != 1 {
+				t.Fatalf("reconnected: inits=%d, want 1", n)
+			}
+
+			s.epoch.Add(1)
+			s.down.Store(false)
+			rows, err = db.Query(ctx, name, "SELECT 1")
+			t.Logf("after recovery: rows=%v, err=%v, inits=%d, dials=%d", rows, err, s.inits.Load(), s.dials.Load())
+			if !tt.plain {
+				if err != nil || len(rows) != 1 || rows[0]["n"] != int64(1) {
+					t.Fatalf("want auto recovery, got rows=%v, err=%v", rows, err)
+				}
+				if s.dials.Load() <= dials {
+					t.Fatal("expected a new physical connection")
+				}
+			} else {
+				if err == nil {
+					t.Fatal("plain error connection must stay broken")
+				}
+				if s.dials.Load() != dials {
+					t.Fatal("unexpected new physical connection")
+				}
+			}
+
+			if !tt.plain {
+				s.epoch.Add(1)
+				rows, err = db.Query(ctx, name, "SELECT 1")
+				t.Logf("idle restart: rows=%v, err=%v, dials=%d", rows, err, s.dials.Load())
+				if err != nil || len(rows) != 1 || rows[0]["n"] != int64(1) {
+					t.Fatalf("want auto recovery on first query, got rows=%v, err=%v", rows, err)
+				}
+			}
+			if n := s.inits.Load(); n != 1 {
+				t.Fatalf("inits=%d, want 1 (no reconnect by this library)", n)
+			}
+		})
 	}
 }

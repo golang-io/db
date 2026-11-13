@@ -340,3 +340,74 @@ func TestColumnTypesUniqueMetadata(t *testing.T) {
 		t.Fatalf("composite unique and unique index must not be mistaken for column unique: %v", err)
 	}
 }
+
+// TestAttachedDatabaseCatalogIsolation 验证 ATTACH 挂载的其他数据库存在同名表、列、索引、约束时，
+// 当前数据库的 HasTable / GetTables / HasColumn / HasIndex / HasConstraint / AutoMigrate 不会被跨库污染。
+func TestAttachedDatabaseCatalogIsolation(t *testing.T) {
+	g := open(t, "")
+	if err := g.Exec(`
+		ATTACH ':memory:' AS other_db;
+		CREATE TABLE other_db.widgets(
+			id UBIGINT PRIMARY KEY,
+			code VARCHAR,
+			extra VARCHAR,
+			CONSTRAINT uni_widgets_code UNIQUE (code)
+		);
+		CREATE INDEX idx_widgets_code ON other_db.widgets(code);
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	type widget struct {
+		ID   uint   `gorm:"primaryKey"`
+		Code string `gorm:"index:idx_widgets_code"`
+	}
+
+	mig := g.Migrator()
+	if mig.HasTable(&widget{}) {
+		t.Fatal("HasTable matched table in attached database")
+	}
+	tables, err := mig.GetTables()
+	if err != nil {
+		t.Fatalf("GetTables: %v", err)
+	}
+	if len(tables) != 0 {
+		t.Fatalf("GetTables = %v, want empty in current database", tables)
+	}
+
+	// 在当前库创建简版表（不含 extra 列、索引和唯一约束），确认各项检查不会误命中 other_db.widgets。
+	if err := g.Exec(`CREATE TABLE widgets(id UBIGINT PRIMARY KEY, code VARCHAR)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if mig.HasColumn(&widget{}, "extra") {
+		t.Fatal("HasColumn matched column in attached database")
+	}
+	if mig.HasIndex(&widget{}, "idx_widgets_code") {
+		t.Fatal("HasIndex matched index in attached database")
+	}
+	if mig.HasConstraint(&widget{}, "uni_widgets_code") {
+		t.Fatal("HasConstraint matched constraint in attached database")
+	}
+
+	// AutoMigrate 应在当前库的 widgets 上补齐 idx_widgets_code 索引，而不是因误判 other_db 已有索引而跳过。
+	if err := g.AutoMigrate(&widget{}); err != nil {
+		t.Fatalf("AutoMigrate with attached database: %v", err)
+	}
+	if !mig.HasIndex(&widget{}, "idx_widgets_code") {
+		t.Fatal("AutoMigrate skipped creating index in current database")
+	}
+
+	// 新模型在当前库不存在而 other_db 存在同名表时，AutoMigrate 必须在当前库建表。
+	if err := g.Exec(`CREATE TABLE other_db.orders(id UBIGINT PRIMARY KEY)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	type order struct {
+		ID uint `gorm:"primaryKey"`
+	}
+	if err := g.AutoMigrate(&order{}); err != nil {
+		t.Fatalf("AutoMigrate order: %v", err)
+	}
+	if err := g.Create(&order{}).Error; err != nil {
+		t.Fatalf("insert into current database orders: %v", err)
+	}
+}
